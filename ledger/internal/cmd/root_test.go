@@ -6,6 +6,8 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+
+	"ledger/internal/gitx"
 )
 
 func initRepo(t *testing.T) string { return initRepoAt(t, t.TempDir()) }
@@ -15,6 +17,11 @@ func initRepo(t *testing.T) string { return initRepoAt(t, t.TempDir()) }
 // directory that also holds a bare store).
 func initRepoAt(t *testing.T, dir string) string {
 	t.Helper()
+	// The persistent cat-file child mmaps packfiles, and Windows refuses to
+	// delete a mapped file. ExecuteArgs closes readers on its own way out, but
+	// a test that packs a store and then lets t.TempDir clean up needs this
+	// too. Cleanups run LIFO, so this runs before TempDir's own removal.
+	t.Cleanup(gitx.CloseBatchReaders)
 	for _, args := range [][]string{{"init", "-b", "main"}, {"commit", "--allow-empty", "-m", "init"}} {
 		c := exec.Command("git", append([]string{"-C", dir, "-c", "user.name=t", "-c", "user.email=t@t"}, args...)...)
 		if out, err := c.CombinedOutput(); err != nil {

@@ -29,6 +29,12 @@ func ExecuteArgs(args []string, stdout, stderr io.Writer) int {
 		out.WriteError(stderr, false, out.Errf("git_too_old", "install git >= 2.40", 1, "%s", err))
 		return 1
 	}
+	// The persistent `cat-file --batch` child holds open handles on the store.
+	// A child dies on stdin EOF when this process exits anyway, but an
+	// in-process caller (chit's own tests, and anything embedding ExecuteArgs)
+	// would otherwise be unable to delete the directory it just read - on
+	// Windows an open handle blocks removal outright.
+	defer gitx.CloseBatchReaders()
 	ctx := &Ctx{Stdout: stdout, Stderr: stderr, TTY: false}
 	if f, ok := stdout.(*os.File); ok {
 		ctx.TTY = out.IsTTY(f)

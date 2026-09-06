@@ -179,6 +179,23 @@ func (s Store) FullHead(slug string) (string, bool) { return s.head(slug) }
 // sync tracking ref refs/ledger-remote/<remote>/<slug> — to a full sha. ok
 // is false when it doesn't resolve (an absent ref, a vanished tracking ref).
 func (s Store) RevParse(rev string) (string, bool) {
+	// A full ref name is a file read (gitx/refs.go), no spawn. What makes a
+	// possibly-stale read safe is the CAS: `update-ref <ref> <new> <old>` does
+	// its own locked comparison, so a stale value costs a retry, never a wrong
+	// write. The read optimises the CAS's first attempt; it is not the
+	// guarantee.
+	//
+	// A MISS still falls through to git. A file read cannot distinguish "this
+	// ref does not exist" from "this ref exists somewhere I did not look", and
+	// answering absent for a ref that exists would turn a live ledger into
+	// unknown_ledger. So the fast path is only trusted when it finds
+	// something; the spawn is paid exactly when the ref is absent, which is
+	// `create`, not the hot path.
+	if strings.HasPrefix(rev, "refs/") {
+		if sha, ok := s.Repo.ReadRef(rev); ok {
+			return sha, true
+		}
+	}
 	out, _, code := s.Repo.Git("", "rev-parse", "-q", "--verify", rev)
 	return out, code == 0
 }
@@ -340,6 +357,13 @@ func (s Store) EventsDAGAt(refName string) ([]model.Event, model.Meta, dag.Resul
 // EventsDAG, the ref itself for EventsDAGAt, which has no slug of its own).
 func (s Store) eventsDAG(refName, label string) ([]model.Event, model.Meta, dag.Result, error) {
 	var meta model.Meta
+	// Topology stays on one `git log`, deliberately. Walking parents through
+	// the persistent reader was tried and measured worse: a parent walk cannot
+	// know the next sha until it has read the current commit, so on a LINEAR
+	// chain - which a ledger's is - each generation holds one commit and the
+	// frontier pipelining degenerates to lockstep. Measured 2026-09-06:
+	// 0.2x at 100 commits, 3.2x SLOWER at 1000, 5.3x slower at 5000.
+	// TestWalkChainVersusGitLog keeps that measurement runnable.
 	out, _, code := s.Repo.Git("", "log", "--format=%H%x09%P", refName)
 	if code != 0 || out == "" {
 		return nil, meta, dag.Result{}, fmt.Errorf("%w: %s", ErrUnknownLedger, label)
@@ -355,6 +379,9 @@ func (s Store) eventsDAG(refName, label string) ([]model.Event, model.Meta, dag.
 		}
 	}
 
+	// The CONTENT fetch is what the persistent child is for: every commit's
+	// event.json and meta.json go out as one pipelined request, and the child
+	// is reused by every later read in this process instead of respawning.
 	reqs := make([]string, 0, len(commits)*2)
 	for _, c := range commits {
 		reqs = append(reqs, c+":event.json", c+":meta.json")
@@ -466,29 +493,15 @@ func (s Store) catBatch(ids []string) (contents []string, present []bool) {
 	if len(ids) == 0 {
 		return contents, present
 	}
-	out, _, _ := s.Repo.GitRaw(strings.Join(ids, "\n"), "cat-file", "--batch")
-	rest := out
-	for i := range ids {
-		nl := strings.IndexByte(rest, '\n')
-		if nl < 0 {
-			break
-		}
-		hdr := strings.Fields(rest[:nl])
-		rest = rest[nl+1:]
-		if len(hdr) >= 2 && hdr[len(hdr)-1] == "missing" {
-			continue
-		}
-		if len(hdr) < 3 {
-			continue
-		}
-		size := 0
-		fmt.Sscanf(hdr[2], "%d", &size)
-		if size > len(rest) {
-			size = len(rest)
-		}
-		contents[i] = rest[:size]
-		present[i] = true
-		rest = strings.TrimPrefix(rest[size:], "\n")
+	// Served by the persistent child (gitx/batch.go) rather than a fresh
+	// `cat-file --batch` per read. A read failure is reported the way a failed
+	// spawn always was: everything absent, never a crash.
+	objs, err := s.Repo.Batch(ids)
+	if err != nil {
+		return contents, present
+	}
+	for i, o := range objs {
+		contents[i], present[i] = o.Content, o.Present
 	}
 	return contents, present
 }

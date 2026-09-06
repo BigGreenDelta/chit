@@ -122,11 +122,15 @@ func CaptureOrigin(r gitx.Repo) Origin {
 	host, _ := os.Hostname()
 	cwd, _ := os.Getwd()
 	o := Origin{Host: host, CWD: cwd, PID: os.Getpid()}
-	br, _, code := r.Git("", "symbolic-ref", "--short", "-q", "HEAD")
-	head, _, _ := r.Git("", "rev-parse", "--short", "HEAD")
+	// One file read where this was two spawns (`symbolic-ref --short -q HEAD`
+	// and `rev-parse --short HEAD`). HEAD is read from the PER-WORKTREE
+	// gitdir, not the common dir - in a linked worktree they differ, and
+	// reading the wrong one silently records the wrong branch in someone's
+	// name rather than failing.
+	branch, head, detached := r.Head()
 	o.Head = head
-	if code == 0 && br != "" {
-		o.Branch = br
+	if !detached && branch != "" {
+		o.Branch = branch
 	} else if head != "" {
 		o.Branch = "(detached@" + head + ")"
 	}

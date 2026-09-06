@@ -17,6 +17,10 @@ import (
 func initRepo(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
+	// The persistent cat-file child mmaps packfiles, and Windows refuses to
+	// delete a mapped file. Cleanups run LIFO and t.TempDir registered its
+	// removal first, so this one runs before it.
+	t.Cleanup(gitx.CloseBatchReaders)
 	for _, args := range [][]string{{"init", "-b", "main"}, {"commit", "--allow-empty", "-m", "init"}} {
 		cmd := exec.Command("git", append([]string{"-C", dir, "-c", "user.name=t", "-c", "user.email=t@t"}, args...)...)
 		if out, err := cmd.CombinedOutput(); err != nil {
