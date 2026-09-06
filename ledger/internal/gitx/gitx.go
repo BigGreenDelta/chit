@@ -117,9 +117,18 @@ func CheckVersion() error {
 	return versionErr
 }
 
+// The identity emails stamped on every commit. Constants because two places
+// now depend on them being the same string: IdentityArgs, which hands them to
+// `commit-tree`, and CommitPayload, which writes the same bytes itself. A
+// divergence would be invisible until someone diffed two stores.
+const (
+	AuthorEmail    = "author@ledger.invalid"
+	CommitterEmail = "marker@ledger.invalid"
+)
+
 func IdentityArgs(author, committer string) []string {
 	return []string{
-		"-c", "user.name=" + author, "-c", "user.email=author@ledger.invalid",
-		"-c", "committer.name=" + committer, "-c", "committer.email=marker@ledger.invalid",
+		"-c", "user.name=" + author, "-c", "user.email=" + AuthorEmail,
+		"-c", "committer.name=" + committer, "-c", "committer.email=" + CommitterEmail,
 	}
 }

@@ -675,32 +675,46 @@ func (s Store) buildCommit(parents []string, ev model.Event, extra map[string]st
 	if err != nil {
 		return "", err
 	}
-	entries := []string{}
+	entries := []gitx.TreeEntry{}
 	files := map[string]string{"event.json": string(body)}
 	for k, v := range extra {
 		files[k] = v
 	}
+	// Written here rather than by hash-object/mktree/commit-tree: three
+	// processes at ~22ms of Windows CreateProcess each, doing work that is a
+	// zlib stream and a hash. See gitx/objects.go for the measurement and for
+	// why READS deliberately stay on git.
 	for name, content := range files {
-		blob, se, code := s.Repo.Git(content, "hash-object", "-w", "--stdin")
-		if code != 0 {
-			return "", fmt.Errorf("git_failed: %s", se)
+		blob, err := s.Repo.WriteObject("blob", []byte(content))
+		if err != nil {
+			return "", err
 		}
-		entries = append(entries, "100644 blob "+blob+"\t"+name)
+		entries = append(entries, gitx.TreeEntry{Name: name, ID: blob})
 	}
-	tree, se, code := s.Repo.Git(strings.Join(entries, "\n")+"\n", "mktree")
-	if code != 0 {
-		return "", fmt.Errorf("git_failed: %s", se)
+	payload, err := gitx.EncodeTree(entries)
+	if err != nil {
+		return "", err
 	}
-	args := append(gitx.IdentityArgs(ev.Author, committerMarker(ev)),
-		"commit-tree", tree, "-m", ev.Type+":"+ev.Key)
-	for _, p := range parents {
-		args = append(args, "-p", p)
+	tree, err := s.Repo.WriteObject("tree", payload)
+	if err != nil {
+		return "", err
 	}
-	csha, se, code := s.Repo.Git("", args...)
-	if code != 0 {
-		return "", fmt.Errorf("git_failed: %s", se)
+	return s.Repo.WriteObject("commit", gitx.CommitPayload(
+		tree, parents, ev.Author, committerMarker(ev), gitStamp(model.Now()),
+		ev.Type+":"+ev.Key))
+}
+
+// gitStamp renders a commit's date the way git does: whole seconds since the
+// epoch, then the local UTC offset as +hhmm. Same shape `commit-tree` would
+// have produced, because `git log` ranks a DAG by commit date and a chain
+// carrying sync merges can be reordered by a stamp of the wrong resolution.
+func gitStamp(t time.Time) string {
+	_, offset := t.Zone()
+	sign := "+"
+	if offset < 0 {
+		sign, offset = "-", -offset
 	}
-	return csha, nil
+	return fmt.Sprintf("%d %s%02d%02d", t.Unix(), sign, offset/3600, (offset%3600)/60)
 }
 
 type TxStep struct{ Ref, New, Old string }
