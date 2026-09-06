@@ -732,4 +732,15 @@ func committerMarker(ev model.Event) string {
 
 // GCAuto keeps stores packed: plumbing never triggers git's own auto-gc
 // (measured: 3 loose objects per event, unbounded). Best-effort by design.
-func (s Store) GCAuto() { s.Repo.Git("", "gc", "--auto", "--quiet") }
+//
+// LEDGER_NO_AUTO_GC skips it. Setting gc.auto=0 on the store is not enough:
+// git still has to be spawned to read that config and decide to do nothing,
+// and on Windows the spawn IS the cost. Only a store that is thrown away
+// before it can grow should set this - a long-lived store that never packs
+// accumulates loose objects without bound.
+func (s Store) GCAuto() {
+	if os.Getenv("LEDGER_NO_AUTO_GC") != "" {
+		return
+	}
+	s.Repo.Git("", "gc", "--auto", "--quiet")
+}

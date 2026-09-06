@@ -277,6 +277,30 @@ func dueAfter(c *Ctx, slug string) (int, bool) {
 	return led.Due(), true
 }
 
+// dueWith reports the same curation debt dueAfter does, without the second
+// whole-chain read: the caller already holds the pre-write fold, and the write
+// appended exactly the events named here.
+//
+// It is sound because Due reads Roots, and Fold derives Roots (and the Losers
+// map it consults) from the event slice and Meta alone - no DAG, no store. So
+// folding the slice in memory is the same computation the re-read performed,
+// not an approximation of it.
+//
+// It is no less accurate than the re-read it replaces. rollup_due is advisory
+// and is computed after the write has already landed, so a concurrent writer
+// could always have moved it between the append and the second read; neither
+// form is a snapshot of anything.
+//
+// Measured 2026-09-06 on Windows: the re-read was 2 of the 15 git subprocesses
+// a `chit set` spends, and process creation is very nearly the whole cost of a
+// write there - 24 spawns/s on one stream, and only 63/s across 16.
+func dueWith(led *fold.Ledger, appended ...model.Event) int {
+	evs := make([]model.Event, 0, len(led.Events)+len(appended))
+	evs = append(evs, led.Events...)
+	evs = append(evs, appended...)
+	return fold.Fold(led.Slug, evs, led.Meta).Due()
+}
+
 func knownKeys(led *fold.Ledger) []string {
 	ks := make([]string, 0, len(led.Spine))
 	for k := range led.Spine {

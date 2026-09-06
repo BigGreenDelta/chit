@@ -73,9 +73,9 @@ func runNote(c *Ctx, stdin io.Reader, kind, key, fromFile string, o writeOpts) e
 			if ev.Type == "note" && ev.IdempotencyKey == o.idemKey && ev.Author == author &&
 				ev.Kind == kind && ev.Key == key {
 				payload := map[string]any{"id": ev.ID, "ledger": led.Slug, "deduped": true, "by": ev.Author}
-				if due, ok := dueAfter(c, led.Slug); ok {
-					payload["rollup_due"] = due
-				}
+				// Deduped: nothing was appended, so the fold already in hand is
+				// current and the second whole-chain read had nothing to find.
+				payload["rollup_due"] = led.Due()
 				outEmit(c, payload, []string{"deduped against " + ev.ID})
 				return nil
 			}
@@ -87,13 +87,12 @@ func runNote(c *Ctx, stdin io.Reader, kind, key, fromFile string, o writeOpts) e
 	if err != nil {
 		return mapStoreErr(err, led.Slug)
 	}
+	ev.ID = id // Append takes ev by value; dueWith folds it as the chain will.
 	payload := map[string]any{"id": id, "ledger": led.Slug, "kind": kind}
 	if key != "" {
 		payload["key"] = key
 	}
-	if due, ok := dueAfter(c, led.Slug); ok {
-		payload["rollup_due"] = due
-	}
+	payload["rollup_due"] = dueWith(led, ev)
 	outEmit(c, payload, []string{"[" + id + "] " + led.Slug + ": note(" + kind + ") " + out.EscapeControls(firstLine(body))})
 	return nil
 }

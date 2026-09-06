@@ -144,9 +144,9 @@ func runSet(c *Ctx, key string, assignments []string, o writeOpts, expect string
 			if ev.Type == "set" && len(ev.Fields) > 0 && ev.IdempotencyKey == o.idemKey &&
 				ev.Author == author && ev.Key == key {
 				payload := map[string]any{"id": ev.ID, "ledger": led.Slug, "deduped": true, "by": ev.Author}
-				if due, ok := dueAfter(c, led.Slug); ok {
-					payload["rollup_due"] = due
-				}
+				// Deduped: nothing was appended, so the fold already in hand is
+				// current and the second whole-chain read had nothing to find.
+				payload["rollup_due"] = led.Due()
 				outEmit(c, payload, []string{"deduped against " + ev.ID})
 				return nil
 			}
@@ -181,9 +181,8 @@ func runSet(c *Ctx, key string, assignments []string, o writeOpts, expect string
 		payload["override"] = ev.Override
 		line += "  " + out.OverrideMarker(ev.Override)
 	}
-	if due, ok := dueAfter(c, led.Slug); ok {
-		payload["rollup_due"] = due
-	}
+	ev.ID = id // AppendChecked may not stamp it; dueWith folds it as the chain will.
+	payload["rollup_due"] = dueWith(led, ev)
 	outEmit(c, payload, []string{line})
 	return nil
 }

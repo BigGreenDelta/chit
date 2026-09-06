@@ -87,6 +87,14 @@ var versionErr error
 // update-ref --stdin transactions and per-refspec prune-fetch are load-bearing.
 func CheckVersion() error {
 	versionOnce.Do(func() {
+		// A pinned, unattended factory re-pays this check on every one of tens
+		// of thousands of short-lived invocations, and the answer cannot change
+		// between them: git is a fixed property of the image or the host. The
+		// escape is explicit and off by default, so an interactive user still
+		// gets the git_too_old refusal.
+		if os.Getenv("LEDGER_NO_VERSION_CHECK") != "" {
+			return
+		}
 		out, _, code := Repo{}.Git("", "--version")
 		if code != 0 {
 			versionErr = fmt.Errorf("git_too_old: git not found")
