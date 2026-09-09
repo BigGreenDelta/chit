@@ -78,6 +78,15 @@ func ExecuteArgs(args []string, stdout, stderr io.Writer) int {
 	for _, f := range registry {
 		root.AddCommand(f(ctx))
 	}
+	// cobra on Windows asks "was I launched from Explorer?" before every
+	// Execute, and answers it by snapshotting the ENTIRE process table
+	// (CreateToolhelp32Snapshot + a Process32Next walk). Measured 2026-09-09
+	// in-process: 26.6 ms with it, ~0 without - it was the whole of the
+	// "unaccounted ~20 ms" of chit startup, and it grows with the number of
+	// processes on the box, so a busy test suite pays more. chit is never
+	// double-clicked. Empty help text is cobra's documented off switch. The
+	// Linux build never compiled the check; this is a Windows-only cost.
+	cobra.MousetrapHelpText = ""
 	root.SetArgs(args)
 	root.SetOut(stdout)
 	root.SetErr(stderr)

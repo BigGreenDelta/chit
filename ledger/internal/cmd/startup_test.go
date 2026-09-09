@@ -103,3 +103,23 @@ func TestStartupCostWithoutEscapes(t *testing.T) {
 	}
 	t.Logf("ExecuteArgs([version]) with NO escapes: %8.3f ms", float64(median(d).Microseconds())/1000)
 }
+
+// TestMousetrapIsOff pins the answer to the question the two tests above
+// left open. A CPU profile of TestStartupCostBreakdown (2026-09-09) put 99.6%
+// of ExecuteArgs([version]) in mousetrap.StartedByExplorer - cobra's
+// Windows-only "launched from Explorer?" check, which walks the whole process
+// table on every Execute. Emptying MousetrapHelpText is cobra's off switch;
+// this asserts it stays emptied, because the regression is silent: chit keeps
+// working, it just spends ~25 ms per invocation reading the process list.
+func TestMousetrapIsOff(t *testing.T) {
+	t.Setenv("LEDGER_NO_VERSION_CHECK", "1")
+	t.Setenv("LEDGER_NO_UPDATE_CHECK", "1")
+	cobra.MousetrapHelpText = "sentinel: must be cleared by ExecuteArgs"
+	var so, se bytes.Buffer
+	if code := ExecuteArgs([]string{"version"}, &so, &se); code != 0 {
+		t.Fatalf("version failed: %d %s", code, se.String())
+	}
+	if cobra.MousetrapHelpText != "" {
+		t.Fatalf("ExecuteArgs left cobra.MousetrapHelpText = %q; the process-table walk is back", cobra.MousetrapHelpText)
+	}
+}
