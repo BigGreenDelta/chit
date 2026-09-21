@@ -177,6 +177,22 @@ func titleFromBoard(p cache.Projection, key string) (string, *board.RenameInfo) 
 	return k.Title, k.RenameInfo()
 }
 
+// requireEvidenceOf is show's cache-backed twin of fold.Fold's own
+// Require init: meta.RequireEvidence never changes after fold (nothing in
+// the switch in fold.go's loop touches it), but fold.Fold always hands back
+// a non-nil map, deep-copied - `{}` when meta declares no requirement, not
+// `null`. A cache.Projection's Meta is the raw meta.json unmarshal, which
+// IS nil in that case, so show's cached path has to apply the same
+// non-nil-empty-map rule fold.Fold applies, or an unrequired board's show
+// renders require_evidence:null against require_evidence:{} from root.
+func requireEvidenceOf(meta model.Meta) map[string][]string {
+	req := map[string][]string{}
+	for f, v := range meta.RequireEvidence {
+		req[f] = append([]string{}, v...)
+	}
+	return req
+}
+
 // findByIDInIndex is findByID's cache-backed twin, and the "replacing
 // findByID's full scan" the spec calls out: a prefix match against the
 // index's lightweight event records costs nothing per event beyond a
@@ -875,7 +891,7 @@ func runShowCached(c *Ctx, p cache.Projection, idx cache.Index, whereRaw []strin
 	}
 	payload := map[string]any{
 		"ledger": p.Slug, "scope": p.Meta.Scope, "state": p.State, "rows": rows,
-		"schema": idx.Schema, "require_evidence": p.Meta.RequireEvidence, "recent_notes": recentNotes,
+		"schema": idx.Schema, "require_evidence": requireEvidenceOf(p.Meta), "recent_notes": recentNotes,
 		"events": eventCount, "head": head,
 	}
 	c.attachFreshnessFor(p.Slug, p.Roots, payload)
