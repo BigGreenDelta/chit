@@ -75,3 +75,38 @@ func (c *Ctx) PickProjection(ledgerFlag string) (cache.Projection, error) {
 	return cache.Projection{}, out.Errf("ambiguous_ledger", "add --ledger <slug>. Open: "+list, 4,
 		"%d ledgers are open - say which one", len(opens))
 }
+
+// LoadIndex is LoadProjection's counterpart over dgd-265's spine-and-events
+// index: the same answer, read through refs/ledger-cache-index/<slug> plus
+// a bounded tail walk instead of a whole-chain fold, falling back to a
+// root fold on the same terms Store.Index does.
+//
+// Nothing calls this for its own single-ref fallback today - status, show
+// and notes want the CHEAPER dual check (CacheSource/CacheIndexSource's
+// TryRead, paired in cachedRead) so a miss on either ref does not cost a
+// second root fold. It exists as LoadProjection's named mirror per spec,
+// and for any future caller content with Index alone.
+func (c *Ctx) LoadIndex(slug string) (cache.Index, error) {
+	ix, err := c.Store.Index(slug)
+	if err != nil {
+		return cache.Index{}, out.Errf("unknown_ledger", c.shadowHint("chit ls --all  (lists every ledger here)"),
+			4, "no ledger '%s' here", slug)
+	}
+	return ix, nil
+}
+
+// PickIndex is PickProjection's counterpart over the index cache. Index
+// alone carries no State (dgd-265's schema deliberately doesn't - status is
+// a projection field), so the ambient "which ledger" decision cannot be
+// made from an index by itself; PickIndex resolves it exactly the way
+// PickProjection does (same order, same three outcomes, same error codes
+// and hints - literally PickProjection's own resolution) and then loads
+// that slug's index, so the two mirrors can never drift on what "ambiguous"
+// or "no open ledger" means.
+func (c *Ctx) PickIndex(ledgerFlag string) (cache.Index, error) {
+	p, err := c.PickProjection(ledgerFlag)
+	if err != nil {
+		return cache.Index{}, err
+	}
+	return c.LoadIndex(p.Slug)
+}

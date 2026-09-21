@@ -54,11 +54,21 @@ func runCacheReset(c *Ctx, slug string) error {
 	if err != nil {
 		return out.Errf("git_failed", "", 1, "%s", err)
 	}
+	// dgd-265: the index ref rebuilds alongside the projection's, on the
+	// same `cache reset` call - a reset that left one of the two refs stale
+	// would make `cache verify` immediately report a difference against the
+	// reset it just ran.
+	ix, err := c.Store.CacheIndexSource(slug).Reset()
+	if err != nil {
+		return out.Errf("git_failed", "", 1, "%s", err)
+	}
 	sha, _ := c.Store.RevParse(store.CacheRef(slug))
+	indexSha, _ := c.Store.RevParse(store.CacheIndexRef(slug))
 	payload := map[string]any{"ledger": slug, "ref": store.CacheRef(slug), "blob": sha,
-		"base": p.Base, "events": p.Count, "keys": len(p.Board.Keys)}
-	outEmit(c, payload, []string{fmt.Sprintf("%s  cache rebuilt from root: %d events, %d keys, base %s",
-		slug, p.Count, len(p.Board.Keys), short(p.Base))})
+		"base": p.Base, "events": p.Count, "keys": len(p.Board.Keys),
+		"index_ref": store.CacheIndexRef(slug), "index_blob": indexSha, "index_events": len(ix.Events)}
+	outEmit(c, payload, []string{fmt.Sprintf("%s  cache rebuilt from root: %d events, %d keys, base %s (index: %d event records)",
+		slug, p.Count, len(p.Board.Keys), short(p.Base), len(ix.Events))})
 	return nil
 }
 
@@ -67,31 +77,43 @@ func runCacheVerify(c *Ctx, slug string) error {
 		return out.Errf("unknown_ledger", c.shadowHint("chit ls --all  (lists every ledger here)"),
 			4, "no ledger '%s' here", slug)
 	}
-	diffs, err := c.Store.CacheSource(slug).Verify()
-	if errors.Is(err, cache.ErrNoCache) {
-		// No ref claims anything, so nothing can be wrong. Exit 0: a store
-		// that has simply never written a cache must not look like a
+	// dgd-265: verify byte-compares BOTH refs. Absence is still the only
+	// thing that exits 0 for a given ref (cache.ErrNoCache); a ref that
+	// exists and is wrong, on either side, is a difference the operator is
+	// told about by name, never silently outvoted by the other ref being
+	// clean.
+	pDiffs, perr := c.Store.CacheSource(slug).Verify()
+	if perr != nil && !errors.Is(perr, cache.ErrNoCache) {
+		return out.Errf("git_failed", "", 1, "%s", perr)
+	}
+	iDiffs, ierr := c.Store.CacheIndexSource(slug).Verify()
+	if ierr != nil && !errors.Is(ierr, cache.ErrNoCache) {
+		return out.Errf("git_failed", "", 1, "%s", ierr)
+	}
+	diffs := append(append([]cache.Diff{}, pDiffs...), iDiffs...)
+
+	if errors.Is(perr, cache.ErrNoCache) && errors.Is(ierr, cache.ErrNoCache) {
+		// Neither ref claims anything, so nothing can be wrong. Exit 0: a
+		// store that has simply never written a cache must not look like a
 		// corrupt one, or `cache verify` cannot be run unconditionally.
 		//
-		// This branch is ABSENCE only. A ref that exists and points at
-		// something that is not a cache blob used to land here too, and so
-		// reported "no cache ref" and exited 0 - the same answer as a clean
-		// store, for a ref somebody had hand-written over. Verify now
-		// returns that as a cache_unreadable difference instead (exit 5):
-		// the read path is right to ignore such a ref, but ignoring it is
-		// precisely the thing an operator asked this verb to tell them
+		// This branch is ABSENCE only, of BOTH refs. A ref that exists and
+		// points at something that is not a cache blob used to land here
+		// too, and so reported "no cache ref" and exited 0 - the same answer
+		// as a clean store, for a ref somebody had hand-written over. Verify
+		// now returns that as a cache_unreadable difference instead (exit
+		// 5): the read path is right to ignore such a ref, but ignoring it
+		// is precisely the thing an operator asked this verb to tell them
 		// about. See cache.ErrUnreadableCache for why the two part here.
-		outEmit(c, map[string]any{"ledger": slug, "ref": store.CacheRef(slug), "cache": nil,
-			"differences": []any{}},
+		outEmit(c, map[string]any{"ledger": slug, "ref": store.CacheRef(slug),
+			"index_ref": store.CacheIndexRef(slug), "cache": nil, "differences": []any{}},
 			[]string{slug + "  no cache ref - nothing to verify (chit cache reset " + slug + " builds one)"})
 		return nil
 	}
-	if err != nil {
-		return out.Errf("git_failed", "", 1, "%s", err)
-	}
 	if len(diffs) == 0 {
-		outEmit(c, map[string]any{"ledger": slug, "ref": store.CacheRef(slug), "differences": []any{}},
-			[]string{slug + "  cache verified: byte-identical to a fold from root"})
+		outEmit(c, map[string]any{"ledger": slug, "ref": store.CacheRef(slug),
+			"index_ref": store.CacheIndexRef(slug), "differences": []any{}},
+			[]string{slug + "  cache verified: byte-identical to a fold from root (both refs)"})
 		return nil
 	}
 	lines := []string{fmt.Sprintf("%s  cache DIFFERS from a fold from root (%d difference(s))", slug, len(diffs))}
@@ -101,8 +123,8 @@ func runCacheVerify(c *Ctx, slug string) error {
 	// The ok:false envelope, same shape sync/push use for partial_failure:
 	// the whole document - outcomes and error contract together - is written
 	// in one write, never a second error document tacked on after.
-	payload := map[string]any{"ledger": slug, "ref": store.CacheRef(slug), "differences": diffs,
-		"ok": false, "error": "cache_differs",
+	payload := map[string]any{"ledger": slug, "ref": store.CacheRef(slug), "index_ref": store.CacheIndexRef(slug),
+		"differences": diffs, "ok": false, "error": "cache_differs",
 		"message": "the cache ref does not match a fold from root",
 		"hint":    "chit cache reset " + slug + "  rebuilds it; see `differences` for where they part"}
 	out.Emit(c.Stdout, c.TTY, payload, lines)
