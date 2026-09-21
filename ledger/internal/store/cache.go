@@ -54,6 +54,15 @@ func (s Store) CacheSource(slug string) cache.Source {
 	}
 }
 
+// CacheIndexSource binds one slug's dgd-265 index cache to this store - the
+// sibling ref alongside CacheSource's, over the spine-and-events schema.
+func (s Store) CacheIndexSource(slug string) cache.IndexSource {
+	return cache.IndexSource{
+		Git: s, Slug: slug, LedgerRef: ref(slug), IndexRef: cacheIndexRef(slug),
+		FoldIndex: func(rev string) (cache.Index, error) { return s.foldIndex(slug, rev) },
+	}
+}
+
 // foldProjection is the from-root fold: the whole-chain read this cache
 // exists to avoid, kept as the single fallback every validation failure
 // degrades to. rev is the ledger's own ref on the ordinary path, and an
@@ -70,6 +79,22 @@ func (s Store) foldProjection(slug, rev string) (cache.Projection, error) {
 	return cache.Project(slug, head, evs, meta, d), nil
 }
 
+// foldIndex is the index's from-root fold: eventsDAGWithSha's blob-sha map
+// rides along on the exact same batch read foldProjection's eventsDAG
+// already pays for on this same rev, so a total cache miss costs one
+// whole-chain read, not two.
+func (s Store) foldIndex(slug, rev string) (cache.Index, error) {
+	evs, meta, _, blobSha, err := s.eventsDAGWithSha(rev, slug)
+	if err != nil {
+		return cache.Index{}, err
+	}
+	head, ok := s.RevParse(rev)
+	if !ok {
+		return cache.Index{}, fmt.Errorf("%w: %s", ErrUnknownLedger, slug)
+	}
+	return cache.BuildIndex(slug, head, evs, meta, func(id string) string { return blobSha[id] }), nil
+}
+
 // Projection answers a `ready`-shaped read through the fold cache, falling
 // back to the whole-chain fold whenever the cache cannot be proven to
 // describe this history. See cache.Source.Read for the three branches.
@@ -77,10 +102,27 @@ func (s Store) Projection(slug string) (cache.Projection, error) {
 	return s.CacheSource(slug).Read()
 }
 
+// Index answers a spine-and-events read through the dgd-265 index cache,
+// falling back to a whole-chain fold on the same terms as Projection. Most
+// callers wanting BOTH the projection and the index want the cheaper dual
+// check instead - CacheSource(slug).TryRead() paired with
+// CacheIndexSource(slug).TryRead() - so a miss on either does not cost a
+// second root fold; Index exists for callers content with the same
+// single-ref fallback Projection gives (`cache reset`/`cache verify`,
+// chiefly).
+func (s Store) Index(slug string) (cache.Index, error) {
+	return s.CacheIndexSource(slug).Read()
+}
+
 // refreshCacheAfterWrite is the write path's cache hook. It runs after an
 // append has already landed, and every error it produces is discarded on
 // purpose: a cache that cannot be written must never turn a successful
-// write into a failure. The cadence gate is inside MaybeRefresh.
+// write into a failure. The cadence gate is inside MaybeRefresh, and the
+// two refs refresh independently: one reaching CacheEvery commits since its
+// own base does not imply the other has too (Amendment 1's write-cost
+// concern - see the index's build worklog for how often that gap forces a
+// fold on a store taking real writes).
 func (s Store) refreshCacheAfterWrite(slug string) {
 	_ = s.CacheSource(slug).MaybeRefresh()
+	_ = s.CacheIndexSource(slug).MaybeRefresh()
 }

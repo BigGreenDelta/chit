@@ -75,6 +75,24 @@ func cacheRef(slug string) string { return "refs/ledger-cache/" + slug }
 // `chit cache` verbs.
 func CacheRef(slug string) string { return cacheRef(slug) }
 
+// cacheIndexRef is dgd-265's second cache ref: refs/ledger-cache-index/
+// <slug>, a sibling of both refs/ledger/<slug> and refs/ledger-cache/<slug>,
+// force-updated the same way and for the same reason. Deliberately its own
+// namespace rather than a second blob under cacheRef's: `ready` and `watch`
+// read only refs/ledger-cache/<slug> and must keep decoding the small v1
+// blob, never the larger index, so the two need to be reachable separately.
+//
+// Deliberately NOT in `chit push`'s force carve-out refspec yet - dgd-268
+// must first rule whether chit should push the cache namespace at all
+// (nothing fetches it and it is rebuildable by one fold). The ref is still
+// created, refreshed, reset and verified identically; it is just not
+// pushed until that lands.
+func cacheIndexRef(slug string) string { return "refs/ledger-cache-index/" + slug }
+
+// CacheIndexRef is cacheIndexRef for the `chit cache` verbs, which must
+// name both refs directly to reset/verify each.
+func CacheIndexRef(slug string) string { return cacheIndexRef(slug) }
+
 // TrackingRef is a synced remote's private tracking ref for one slug. The
 // namespace is refs/ledger-remote/, deliberately NOT refs/remotes/, which
 // git's own default branch refspec also populates (verified fatal collision
@@ -370,6 +388,17 @@ func (s Store) EventsDAGAt(refName string) ([]model.Event, model.Meta, dag.Resul
 // ref to read (refName) and the label an error names (label — the slug for
 // EventsDAG, the ref itself for EventsDAGAt, which has no slug of its own).
 func (s Store) eventsDAG(refName, label string) ([]model.Event, model.Meta, dag.Result, error) {
+	evs, meta, d, _, err := s.eventsDAGWithSha(refName, label)
+	return evs, meta, d, err
+}
+
+// eventsDAGWithSha is eventsDAG plus the one extra thing dgd-265's index
+// needs from a from-root fold: the event.json blob sha behind each event id.
+// It is not a second read - git cat-file --batch's header line names the
+// RESOLVED object for a "commit:path" request, which for event.json IS the
+// blob this event's record wants, so the persistent batch child this
+// function already pays for hands the sha back at no extra cost.
+func (s Store) eventsDAGWithSha(refName, label string) ([]model.Event, model.Meta, dag.Result, map[string]string, error) {
 	var meta model.Meta
 	// Topology stays on one `git log`, deliberately. Walking parents through
 	// the persistent reader was tried and measured worse: a parent walk cannot
@@ -380,7 +409,7 @@ func (s Store) eventsDAG(refName, label string) ([]model.Event, model.Meta, dag.
 	// TestWalkChainVersusGitLog keeps that measurement runnable.
 	out, _, code := s.Repo.Git("", "log", "--format=%H%x09%P", refName)
 	if code != 0 || out == "" {
-		return nil, meta, dag.Result{}, fmt.Errorf("%w: %s", ErrUnknownLedger, label)
+		return nil, meta, dag.Result{}, nil, fmt.Errorf("%w: %s", ErrUnknownLedger, label)
 	}
 	lines := strings.Split(out, "\n")
 	commits := make([]string, len(lines))
@@ -396,30 +425,45 @@ func (s Store) eventsDAG(refName, label string) ([]model.Event, model.Meta, dag.
 	// The CONTENT fetch is what the persistent child is for: every commit's
 	// event.json and meta.json go out as one pipelined request, and the child
 	// is reused by every later read in this process instead of respawning.
+	// Read via Batch directly, not catBatch's (content, present) pair: OID is
+	// the resolved event.json blob's own sha, and eventsDAGWithSha's callers
+	// want it alongside the content this same request already fetches.
 	reqs := make([]string, 0, len(commits)*2)
 	for _, c := range commits {
 		reqs = append(reqs, c+":event.json", c+":meta.json")
 	}
-	contents, present := s.catBatch(reqs)
+	objs, err := s.Repo.Batch(reqs)
+	if err != nil {
+		objs = nil
+	}
 
 	nodes := make([]dag.Node, len(commits))
 	byEvent := make(map[string]model.Event, len(commits))
+	blobSha := make(map[string]string, len(commits))
 	for i, c := range commits {
 		evIdx, metaIdx := 2*i, 2*i+1
-		if present[metaIdx] {
-			json.Unmarshal([]byte(contents[metaIdx]), &meta)
+		var evObj, metaObj gitx.Object
+		if evIdx < len(objs) {
+			evObj = objs[evIdx]
+		}
+		if metaIdx < len(objs) {
+			metaObj = objs[metaIdx]
+		}
+		if metaObj.Present {
+			json.Unmarshal([]byte(metaObj.Content), &meta)
 		}
 		node := dag.Node{SHA: c, Parents: parents[i]}
 		var ev model.Event
-		if !present[evIdx] {
+		if !evObj.Present {
 			node.IsSentinel = true // torn/foreign commit: contract out, never crash a read
-		} else if err := json.Unmarshal([]byte(contents[evIdx]), &ev); err != nil {
+		} else if err := json.Unmarshal([]byte(evObj.Content), &ev); err != nil {
 			node.IsSentinel = true
 		} else {
 			ev.ID = c[:10]
 			node.TS = ev.TS
 			node.IsSentinel = ev.Type == "sync"
 			byEvent[c] = ev
+			blobSha[ev.ID] = evObj.OID
 		}
 		nodes[i] = node
 	}
@@ -429,7 +473,7 @@ func (s Store) eventsDAG(refName, label string) ([]model.Event, model.Meta, dag.
 	for _, sha := range result.Order {
 		evs = append(evs, byEvent[sha])
 	}
-	return evs, meta, result, nil
+	return evs, meta, result, blobSha, nil
 }
 
 // Committers reads every commit's committer name in one `git log` pass and
