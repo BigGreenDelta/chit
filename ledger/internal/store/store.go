@@ -61,6 +61,20 @@ func ref(slug string) string { return "refs/ledger/" + slug }
 // the plumbing here doesn't otherwise expose.
 func Ref(slug string) string { return ref(slug) }
 
+// cacheRef is a ledger's fold-cache ref: refs/ledger-cache/<slug>, a
+// force-updated SIBLING of refs/ledger/<slug> pointing at a blob, never a
+// commit in the chain (D76 as revised 2026-09-18). The namespace is
+// deliberately a sibling and not a subtree of refs/ledger/: a subtree would
+// be swept up by sync's and push's existing refs/ledger/* refspecs, which
+// are non-force, and a cache ref that cannot be force-updated is not a
+// cache. See internal/cache for what the blob carries.
+func cacheRef(slug string) string { return "refs/ledger-cache/" + slug }
+
+// CacheRef is cacheRef for the two callers outside this package that must
+// name the ref directly: `chit push`'s force carve-out refspec, and the
+// `chit cache` verbs.
+func CacheRef(slug string) string { return cacheRef(slug) }
+
 // TrackingRef is a synced remote's private tracking ref for one slug. The
 // namespace is refs/ledger-remote/, deliberately NOT refs/remotes/, which
 // git's own default branch refspec also populates (verified fatal collision
@@ -633,6 +647,12 @@ func (s Store) casLoop(slug string, mode ExpectMode, pre Precondition, build fun
 		}
 		if _, _, code := s.Repo.Git("", "update-ref", ref(slug), tip, cur); code == 0 {
 			s.GCAuto()
+			// The fold cache's write path (internal/cache, CacheEvery): after
+			// the write has LANDED, not as part of it. Batched, so most
+			// appends do nothing here but a bounded parent walk, and any
+			// failure is discarded - a cache is not allowed to fail a write
+			// that already succeeded.
+			s.refreshCacheAfterWrite(slug)
 			return tip, nil
 		}
 		time.Sleep(time.Duration(attempt) * 10 * time.Millisecond)

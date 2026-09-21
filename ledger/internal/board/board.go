@@ -112,6 +112,18 @@ type Board struct {
 // this board resolves by, and the losers stay greppable in the chain.
 func Build(meta model.Meta, events []model.Event) *Board {
 	b := &Board{Meta: meta, Keys: map[string]*Key{}}
+	b.apply(events, 0)
+	b.resolveTitles()
+	return b
+}
+
+// apply is Build's single pass, generalized over the position the first
+// event occupies in the fold. offset is 0 for Build itself; the fold cache's
+// tail resume (ApplyTail) hands in the cached prefix's length, so statusSeq
+// and blockedBySeq stay positions in the WHOLE chain's fold order rather
+// than in whichever slice this call happened to see. That is the only thing
+// those two fields are ever compared across.
+func (b *Board) apply(events []model.Event, offset int) {
 	for i, ev := range events {
 		if ev.Type != "set" || ev.Key == "" {
 			continue
@@ -134,17 +146,17 @@ func Build(meta model.Meta, events []model.Event) *Board {
 					Value: value, ID: ev.ID, Author: ev.Author, TS: ev.TS,
 					Note: ev.Text, Evidence: ev.Evidence,
 				}
-				k.statusSeq = i
+				k.statusSeq = offset + i
 			case "labels":
 				k.LabelsID = ev.ID
 				k.setMulti(field, SplitTokens(value))
 			case "blocked-by":
 				k.BlockedByID = ev.ID
 				k.BlockedByTS = ev.TS
-				k.blockedBySeq = i
+				k.blockedBySeq = offset + i
 				k.setMulti(field, SplitTokens(value))
 			default:
-				if model.Contains(meta.MultiFields, field) {
+				if model.Contains(b.Meta.MultiFields, field) {
 					k.setMulti(field, SplitTokens(value))
 					continue
 				}
@@ -158,18 +170,22 @@ func Build(meta model.Meta, events []model.Event) *Board {
 			}
 		}
 	}
-	// The title resolves after the pass, never inside it: a rename can sit
-	// BEFORE its key's seed in fold order (a two-root merge leaves exactly
-	// that), so only the finished per-key rename list answers "which rename
-	// is last". Fold-total by construction: a key with renames and no seed
-	// still gets a title.
+}
+
+// resolveTitles settles every key's title from its finished rename list.
+// The title resolves after the pass, never inside it: a rename can sit
+// BEFORE its key's seed in fold order (a two-root merge leaves exactly
+// that), so only the finished per-key rename list answers "which rename
+// is last". Fold-total by construction: a key with renames and no seed
+// still gets a title. Idempotent, which is what lets ApplyTail re-run it
+// over a restored prefix instead of rebuilding the list.
+func (b *Board) resolveTitles() {
 	for _, k := range b.Keys {
 		k.Title = k.SeedTitle
 		if n := len(k.Renames); n > 0 {
 			k.Title = k.Renames[n-1].Text
 		}
 	}
-	return b
 }
 
 // RenameInfo is the label a renamed key's title carries wherever it renders;

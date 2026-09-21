@@ -446,7 +446,7 @@ func TestWatchFollowCursorlessEmitsStartLine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cur, start, err := resolveStartCursor(c, led, "", true)
+	cur, start, err := resolveStartCursor(c, led.Slug, "", true)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -74,10 +74,14 @@ func TestQuickstartExamplesExecute(t *testing.T) {
 // curatedOutOfQuickstart are verbs deliberately absent from the quickstart's
 // doctrine: render/version/update/quickstart act on the binary or a file
 // path rather than board/coordination doctrine, and completion/help are
-// cobra machinery, not chit verbs.
+// cobra machinery, not chit verbs. `cache` joins them for the same reason -
+// it maintains a DERIVED ref (refs/ledger-cache/<slug>) that no read ever
+// depends on being correct, so an agent picking work has nothing to learn
+// from it. Teaching it in the quickstart would suggest the opposite: that a
+// board can be wrong until someone runs a cache verb.
 var curatedOutOfQuickstart = map[string]bool{
 	"render": true, "version": true, "update": true, "quickstart": true,
-	"completion": true, "help": true,
+	"completion": true, "help": true, "cache": true,
 }
 
 // TestQuickstartMentionsEveryVerb guards against the doctrine silently

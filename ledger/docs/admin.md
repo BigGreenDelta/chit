@@ -27,6 +27,31 @@ watching them the way they watch `main`.
 (or the newer `--force-with-lease`-only workflow) and consider
 `receive.denyDeletes` — see the tradeoff below before turning that on.
 
+## `refs/ledger-cache/*`: derived, force-updated, safe to lose
+
+Alongside each ledger ref sits `refs/ledger-cache/<slug>`: a single blob
+holding the folded board projection plus the ledger sha it was folded from.
+`chit ready` and `chit watch` read it instead of folding the whole chain.
+
+Three facts an admin needs:
+
+- It is **derived**. It holds no event that `refs/ledger/<slug>` does not
+  hold. Deleting it costs nothing but speed, and `chit cache reset <slug>`
+  rebuilds it. `chit cache verify <slug>` re-folds from root and byte-
+  compares, exiting non-zero if they differ.
+- It is **force-updated**, and `chit push` force-pushes it - the one
+  exception to chit's otherwise non-force push. A remote with
+  `receive.denyNonFastForwards` set will therefore reject the cache ref on
+  every push after the first. That is harmless: replication of the cache
+  stops, reads on the far side fold from root, and nothing is lost or
+  wrong. Scope the setting to `refs/ledger/*` if you want both.
+- It is **never trusted blind**. A reader that cannot prove the blob
+  describes its own history - because the base sha is foreign, ahead of the
+  local tip, or separated from it by a merge - ignores the blob entirely and
+  folds from root. That is what makes a pushed cache safe between replicas
+  with no handshake, and it means a stale or hostile cache ref can make a
+  read slower but never wrong.
+
 ## `receive.denyDeletes`: the tradeoff
 
 `receive.denyDeletes` on the remote blocks any push that deletes a ref,

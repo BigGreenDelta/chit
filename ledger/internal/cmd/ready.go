@@ -33,7 +33,12 @@ func runReady(c *Ctx, ledgerFlag string, whereRaw []string, limit int, at string
 	if err != nil {
 		return err
 	}
-	led, err := c.PickLedger(ledgerFlag)
+	// `ready` is one of exactly two verbs that read through the fold cache
+	// (dgd-237). It can, because everything it renders comes out of
+	// board.Build's per-key projection plus AllContests' output, and the
+	// cache blob carries both. It stops short of the event list, which is
+	// why `status`, `show`, `notes` and the rest still fold the whole chain.
+	led, err := c.PickProjection(ledgerFlag)
 	if err != nil {
 		return err
 	}
@@ -48,11 +53,11 @@ func runReady(c *Ctx, ledgerFlag string, whereRaw []string, limit int, at string
 		return err
 	}
 
-	b := board.Build(led.Meta, led.Events)
-	// The board-wide cover-set pass runs once, here, off the SAME read the
-	// fold came from (Ctx.Load carries the chain's DAG alongside its
-	// events) — never a second fold to recover the shape.
-	b.ComputeContests(led.Events, led.DAG)
+	// The board and its contests both arrive already folded: either straight
+	// off the cache blob, or from the cache's one fallback - a whole-chain
+	// read that runs board.Build and the board-wide cover-set pass off the
+	// same single read, exactly as this line used to do inline.
+	b := led.Board
 	filter := func(k *board.Key) bool { return matchWhere(k, clauses) }
 	env := b.Envelope(now, limit, filter)
 
@@ -61,8 +66,8 @@ func runReady(c *Ctx, ledgerFlag string, whereRaw []string, limit int, at string
 		"ready": env.Ready, "held": env.Held, "blocked": env.Blocked, "attention": env.Attention,
 		"totals": env.Totals,
 	}
-	c.attachFreshness(led, payload)
-	lines := addRedirect(c, led, payload)
+	c.attachFreshnessFor(led.Slug, led.Roots, payload)
+	lines := addRedirectFor(c, led.SupersededBy, led.ExtraLinks, payload)
 	lines = append(lines, readyLines(led.Slug, env)...)
 	outEmit(c, payload, lines)
 	return nil

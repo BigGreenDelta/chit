@@ -706,24 +706,35 @@ func showIDLines(ev model.Event, committers map[string]string) []string {
 // redirect line — a reader must never have to guess it's looking at a
 // forwarding address.
 func addRedirect(c *Ctx, led *fold.Ledger, payload map[string]any) []string {
-	if led.SupersededBy == "" {
+	return addRedirectFor(c, led.SupersededBy, led.ExtraLinks, payload)
+}
+
+// addRedirectFor is addRedirect over the two fold scalars it needs, so a
+// cached `ready` read (which has them off the cache blob, and no
+// fold.Ledger) renders the identical redirect.
+func addRedirectFor(c *Ctx, supersededBy string, extraLinks []string, payload map[string]any) []string {
+	if supersededBy == "" {
 		return nil
 	}
-	payload["superseded_by"] = led.SupersededBy
-	if len(led.ExtraLinks) > 0 {
-		payload["extra_links"] = led.ExtraLinks
+	payload["superseded_by"] = supersededBy
+	if len(extraLinks) > 0 {
+		payload["extra_links"] = extraLinks
 	}
-	return []string{redirectLine(c, led)}
+	return []string{redirectLineFor(c, supersededBy)}
 }
 
 // redirectLine is show's lead line on a superseded ledger: the redirect, or
 // — when the successor hasn't arrived locally yet — the sync hint. Load
 // failing (unknown_ledger) is exactly "not present locally".
 func redirectLine(c *Ctx, led *fold.Ledger) string {
-	if _, err := c.Load(led.SupersededBy); err != nil {
-		return "successor '" + led.SupersededBy + "' not present locally — run chit sync"
+	return redirectLineFor(c, led.SupersededBy)
+}
+
+func redirectLineFor(c *Ctx, supersededBy string) string {
+	if _, err := c.Load(supersededBy); err != nil {
+		return "successor '" + supersededBy + "' not present locally — run chit sync"
 	}
-	return "superseded by '" + led.SupersededBy + "' — read/write there"
+	return "superseded by '" + supersededBy + "' — read/write there"
 }
 
 // ---- notes ----

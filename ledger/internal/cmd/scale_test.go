@@ -74,6 +74,17 @@ func seedReadyBoard(t *testing.T, dir, slug string, evs []model.Event) store.Sto
 	}
 	scaletest.Seed(t, s.Repo, slug, evs, map[string]string{"meta.json": string(metaJSON)})
 	s.Repo.Git("", "gc", "--quiet")
+	// Mint the fold cache off the seeded chain, once, before any caller
+	// starts counting bytes. A live ledger always has one: the write path
+	// mints it on the first append that finds the ref absent and refreshes
+	// it every cache.CacheEvery commits after that. A fixture without one
+	// would fold the chain from root a second time inside the very first
+	// measured write - a cost production pays once per ledger, never per
+	// write - and every cost assertion below would be measuring that mint
+	// rather than the precondition read it is about.
+	if _, err := s.CacheSource(slug).Reset(); err != nil {
+		t.Fatal(err)
+	}
 	return s
 }
 

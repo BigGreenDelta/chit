@@ -23,15 +23,25 @@ import (
 // only ever ADDS the "freshness" key, never touches anything else the
 // caller already put in payload.
 func (c *Ctx) attachFreshness(led *fold.Ledger, payload map[string]any) {
+	c.attachFreshnessFor(led.Slug, led.DAG.Roots, payload)
+}
+
+// attachFreshnessFor is attachFreshness over the two facts it actually
+// needs - the slug, and the local chain's sentinel-contracted root set. A
+// cached `ready` read has both (the cache blob carries the root set, which
+// is exact: every commit in a cacheable tail has a parent, so no tail commit
+// is ever a root and the prefix's root set is the whole chain's) but has no
+// fold.Ledger to hand over.
+func (c *Ctx) attachFreshnessFor(slug string, roots []string, payload map[string]any) {
 	remote := freshnessRemote(c)
 	if remote == "" {
 		return
 	}
-	track, ok := c.Store.RevParse(store.TrackingRef(remote, led.Slug))
+	track, ok := c.Store.RevParse(store.TrackingRef(remote, slug))
 	if !ok {
 		return // nothing fetched from this remote for this slug yet
 	}
-	local, ok := c.Store.FullHead(led.Slug)
+	local, ok := c.Store.FullHead(slug)
 	if !ok {
 		return
 	}
@@ -47,8 +57,8 @@ func (c *Ctx) attachFreshness(led *fold.Ledger, payload map[string]any) {
 	// paths; local's roots ride along on led.DAG, already read once by the
 	// caller's own load.
 	trackRoots := c.Store.Roots(track)
-	if !rootsIntersect(led.DAG.Roots, trackRoots) {
-		hint := rootMismatchDetail(c, led.Slug, led.DAG.Roots, trackRoots)
+	if !rootsIntersect(roots, trackRoots) {
+		hint := rootMismatchDetail(c, slug, roots, trackRoots)
 		payload["freshness"] = map[string]any{"hint": hint}
 		fmt.Fprintln(c.Stderr, "[chit] "+hint)
 		return

@@ -8,7 +8,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"ledger/internal/dag"
-	"ledger/internal/fold"
 	"ledger/internal/model"
 	"ledger/internal/out"
 )
@@ -35,30 +34,35 @@ import (
 //     which makes `cursor..C` exactly the delivered set; if the range
 //     exhausts before such a C exists, it emits the tip, same as unpaged.
 //     --limit is therefore a floor, not a ceiling.
-func deliverRange(c *Ctx, led *fold.Ledger, cursor string, limit int, resetHint string) ([]model.Event, string, error) {
+func deliverRange(c *Ctx, slug string, cursor string, limit int, resetHint string) ([]model.Event, string, error) {
 	// The tip is read BEFORE the events, and that order is load-bearing: the
 	// event read must cover every commit in the range, or a commit that
 	// landed between the two reads would look like a sentinel (contracted
 	// out, never delivered) while the cursor advanced past it. Reading the
 	// tip first bounds the range by the older read; anything newer is simply
 	// left for the next call.
-	tip, err := c.Store.HeadSHA(led.Slug)
+	tip, err := c.Store.HeadSHA(slug)
 	if err != nil {
-		return nil, "", mapStoreErr(err, led.Slug)
+		return nil, "", mapStoreErr(err, slug)
 	}
 	if cursor != "" && !c.Store.IsAncestor(cursor, tip) {
 		return nil, "", out.Errf("reset_required", resetHint, 4,
-			"cursor '%s' is not on ledger '%s'", cursor, led.Slug)
-	}
-	evs, _, err := c.Store.Events(led.Slug)
-	if err != nil {
-		return nil, "", mapStoreErr(err, led.Slug)
-	}
-	byID := make(map[string]model.Event, len(evs))
-	for _, ev := range evs {
-		byID[ev.ID] = ev
+			"cursor '%s' is not on ledger '%s'", cursor, slug)
 	}
 	nodes, err := c.Store.RangeNodes(cursor, tip)
+	if err != nil {
+		return nil, "", out.Errf("git_failed", "", 1, "%s", err)
+	}
+	// The events come from the RANGE's own nodes, never from a whole-chain
+	// read. byID was built from Store.Events until dgd-237: on a 16,000-event
+	// ledger that made an idle `chit watch` poll - which delivers nothing -
+	// re-read and re-fold the entire chain every 200 ms, while the range it
+	// actually needed was empty. Nothing else about the contract moves: the
+	// lookup table only ever has to cover the range, the tip is still read
+	// BEFORE the events (so a commit landing mid-call is left for the next
+	// poll rather than advancing the cursor past it), and a node with no
+	// readable event is still contracted out below exactly as before.
+	byID, err := c.Store.EventsOfNodes(nodes)
 	if err != nil {
 		return nil, "", out.Errf("git_failed", "", 1, "%s", err)
 	}
@@ -136,7 +140,7 @@ func runSince(c *Ctx, cursor string, limit int, ledgerFlag string) error {
 	if err != nil {
 		return err
 	}
-	evs, next, err := deliverRange(c, led, cursor, limit,
+	evs, next, err := deliverRange(c, led.Slug, cursor, limit,
 		"chit status refolds current state; chit tail -n 50 shows recent events")
 	if err != nil {
 		return err
@@ -191,13 +195,13 @@ func newWatchCmd(c *Ctx) *cobra.Command {
 // line on stdout, because --follow's per-event stream has no enclosing
 // envelope to carry `starting_cursor` in the way the non-follow path's
 // final drain/timeout payload does (see the `start` merge in runWatch).
-func resolveStartCursor(c *Ctx, led *fold.Ledger, since string, follow bool) (string, map[string]any, error) {
+func resolveStartCursor(c *Ctx, slug string, since string, follow bool) (string, map[string]any, error) {
 	if since != "" {
 		return since, map[string]any{}, nil
 	}
-	h, err := c.Store.HeadID(led.Slug)
+	h, err := c.Store.HeadID(slug)
 	if err != nil {
-		return "", nil, mapStoreErr(err, led.Slug)
+		return "", nil, mapStoreErr(err, slug)
 	}
 	start := map[string]any{"starting_cursor": h}
 	switch {
@@ -214,12 +218,16 @@ func runWatch(c *Ctx, o watchOpts) error {
 	if o.follow && o.timeoutSet {
 		return out.Errf("bad_value", "drop --timeout — --follow streams until killed", 4, "--follow has no timeout")
 	}
-	led, err := c.PickLedger(o.ledger)
+	// watch resolves its ledger through the fold cache (dgd-237): the pick
+	// needs the ledger's state and last-write timestamp, which the cached
+	// projection carries, not its event list. The per-tick cost is
+	// deliverRange's, fixed separately above.
+	led, err := c.PickProjection(o.ledger)
 	if err != nil {
 		return err
 	}
 
-	cur, start, err := resolveStartCursor(c, led, o.since, o.follow)
+	cur, start, err := resolveStartCursor(c, led.Slug, o.since, o.follow)
 	if err != nil {
 		return err
 	}
@@ -233,7 +241,7 @@ func runWatch(c *Ctx, o watchOpts) error {
 		// Addition 2, the one amendment this design makes to the parent's
 		// "same bound applies to watch"). deliverRange re-reads the ref and
 		// the chain per poll, which is what makes this loop see new events.
-		evs, next, err := deliverRange(c, led, cur, 0,
+		evs, next, err := deliverRange(c, led.Slug, cur, 0,
 			"restart with `chit watch` (no --since) to watch from now")
 		if err != nil {
 			return err

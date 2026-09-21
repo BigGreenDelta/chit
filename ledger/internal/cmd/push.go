@@ -19,7 +19,12 @@ func newPushCmd(c *Ctx) *cobra.Command {
 		Long: "Pushes refs/ledger/<slug> to the same ref on the remote, never with --force.\n" +
 			"With no arguments every local slug is pushed; naming slugs pushes only those —\n" +
 			"the privacy lever, so one handoff ledger can go out without publishing everything.\n" +
-			"Everything pushed is readable by anyone with read access to the repo.",
+			"Everything pushed is readable by anyone with read access to the repo.\n" +
+			"\n" +
+			"One narrow exception to non-force: refs/ledger-cache/<slug>, the fold cache,\n" +
+			"is force-pushed. It is a derived blob, not history - it holds no event no other\n" +
+			"ref holds, and a reader that cannot prove it describes its own chain ignores it\n" +
+			"and folds from root. The ledger refs themselves are never forced.",
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error { return runPush(c, remote, args) }}
 	cmd.Flags().StringVar(&remote, "remote", "", "git remote name (default: .ledger.toml's remote, else origin)")
@@ -81,14 +86,13 @@ func runPush(c *Ctx, remoteFlag string, args []string) error {
 // mismatch can be diagnosed with the two-creator error instead of the
 // generic retry instruction.
 func (c *Ctx) pushBatch(remote string, slugs []string) []SlugOutcome {
-	refspecs := make([]string, len(slugs))
-	for i, s := range slugs {
-		refspecs[i] = store.Ref(s) + ":" + store.Ref(s)
-	}
+	refspecs := c.cacheAwareRefspecs(slugs)
 	repo := netRepo(c.Store.Repo)
 	// advice.pushNonFastForward=false drops git's own "git pull" hint —
 	// wrong advice for phantom refs, and this tool prints its own retry
-	// instruction instead. Always non-force: no +refspec, no --force flag.
+	// instruction instead. Non-force for every ledger ref: no +refspec and
+	// no --force flag, the sole exception being the derived cache refs
+	// named above.
 	args := append([]string{"-c", "advice.pushNonFastForward=false", "push", "--porcelain", remote}, refspecs...)
 	stdout, stderr, code := repo.Git("", args...)
 	flags := parsePushPorcelain(stdout)
@@ -146,8 +150,15 @@ func (c *Ctx) pushBatch(remote string, slugs []string) []SlugOutcome {
 
 // parsePushPorcelain reads `git push --porcelain`'s per-ref status lines —
 // "<flag>\t<from>:<to>\t<summary>" — into a slug -> flag map. Flags: '='
-// up to date, '*' a new ref, ' ' (space) a fast-forward, '!' rejected.
-// '+' (forced) never appears — push is always non-force.
+// up to date, '*' a new ref, ' ' (space) a fast-forward, '!' rejected,
+// and '+' (forced) on the fold-cache refs, which are the one forced
+// namespace.
+//
+// Only refs under refs/ledger/ are keyed here, and that is deliberate:
+// refs/ledger-cache/<slug> does not share the refs/ledger/ prefix (it ends
+// in a slash), so a cache ref's own line is skipped and can never overwrite
+// its ledger's outcome. A cache ref that fails to replicate is not a failed
+// push of the ledger - the cache is derived and never authoritative.
 func parsePushPorcelain(stdout string) map[string]byte {
 	prefix := store.Ref("")
 	flags := make(map[string]byte)
@@ -170,4 +181,39 @@ func parsePushPorcelain(stdout string) map[string]byte {
 		flags[strings.TrimPrefix(to, prefix)] = flag
 	}
 	return flags
+}
+
+// cacheAwareRefspecs builds the push refspecs for a batch: every slug's
+// ledger ref non-force, plus its fold-cache ref forced. Extracted so a
+// test can assert the shape of the carve-out directly - that the exception
+// is exactly one namespace wide - rather than inferring it from a push's
+// side effects.
+func (c *Ctx) cacheAwareRefspecs(slugs []string) []string {
+	refspecs := make([]string, 0, len(slugs)*2)
+	for _, s := range slugs {
+		refspecs = append(refspecs, store.Ref(s)+":"+store.Ref(s))
+		// The fold-cache carve-out (dgd-237). THE LEADING "+" IS LOAD-BEARING
+		// AND MUST NOT BE REMOVED: refs/ledger-cache/<slug> is force-updated
+		// on every refresh, so its remote counterpart is never a
+		// fast-forward of its local one. Drop the "+" and git rejects the
+		// cache ref on the second push forever after - silently, because the
+		// per-ref rejection is reported against a ref no outcome is keyed on,
+		// and replication just stops while `chit push` keeps exiting 0.
+		//
+		// The namespace is named EXPLICITLY, one refspec per slug, for two
+		// reasons. It is the only namespace this tool ever forces, so a
+		// wildcard would be a standing permission rather than a stated one.
+		// And it does NOT travel with the ledger refspec: verified
+		// 2026-09-17 that "+refs/ledger/*:refs/ledger/*" does not match
+		// refs/ledger-cache/* at all (the prefix ends in a slash), so a
+		// cache ref left unnamed here is simply never replicated.
+		//
+		// Only slugs whose cache ref EXISTS are named: git validates every
+		// refspec before pushing any of them, so one unresolvable source
+		// would abort the whole batch and lose every other slug with it.
+		if _, ok := c.Store.RevParse(store.CacheRef(s)); ok {
+			refspecs = append(refspecs, "+"+store.CacheRef(s)+":"+store.CacheRef(s))
+		}
+	}
+	return refspecs
 }
