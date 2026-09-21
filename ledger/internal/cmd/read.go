@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"ledger/internal/board"
+	"ledger/internal/cache"
 	"ledger/internal/fold"
 	"ledger/internal/model"
 	"ledger/internal/out"
@@ -112,6 +113,141 @@ func sortRows(rows []row) {
 		}
 		return rows[i].Branch < rows[j].Branch
 	})
+}
+
+// ---- dgd-265: cache-backed row/event helpers ----
+//
+// The functions below are status/show/notes' index-backed twins of
+// rowOf/spineRows/titleOf/findByID: same output shape, sourced from
+// cache.Index's spine and event records instead of a *fold.Ledger. Title
+// rendering is the one exception - it reads a cache.Projection's Board
+// directly (already the same *board.Board a whole-chain fold would have
+// built) rather than re-deriving anything.
+
+// rowFromSpineEntry is rowOf's cache-backed twin: a SpineEntry already
+// carries every field rowOf would have read off the winning "set" event, so
+// this is a field rename, not a re-derivation.
+func rowFromSpineEntry(key, field string, e cache.SpineEntry) row {
+	return row{Key: key, Field: field, Value: e.Value, Note: e.Note, By: e.By,
+		Branch: e.Branch, TS: e.TS, ID: e.ID, Evidence: e.Evidence}
+}
+
+// spineRowsFromIndex is spineRows' cache-backed twin.
+func spineRowsFromIndex(idx cache.Index, field string) []row {
+	rows := []row{}
+	for key, fields := range idx.Spine {
+		for f, e := range fields {
+			if field != "" && f != field {
+				continue
+			}
+			rows = append(rows, rowFromSpineEntry(key, f, e))
+		}
+	}
+	sortRows(rows)
+	return rows
+}
+
+// knownKeysFromIndex is knownKeys' cache-backed twin - the hint list for
+// status's unknown_key error.
+func knownKeysFromIndex(idx cache.Index) []string {
+	ks := make([]string, 0, len(idx.Spine))
+	for k := range idx.Spine {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	return ks
+}
+
+// titleFromBoard is titleOf's cache-backed twin: a cache.Projection's Board
+// is already board.Build(meta, the WHOLE chain's events) - kept correct
+// across every tail resume by cache.Source's own ApplyTail - so a single
+// key's title and rename history read straight off it rather than folding
+// that key's own events a second time. Board.apply only ever touches
+// b.Keys[ev.Key] per event, so one key's entry is identical whether it was
+// built alongside every other key or alone, which is what makes this
+// interchangeable with titleOf's mini-fold.
+func titleFromBoard(p cache.Projection, key string) (string, *board.RenameInfo) {
+	if !model.ReadyCapable(p.Meta) {
+		return "", nil
+	}
+	k, ok := p.Board.Keys[key]
+	if !ok {
+		return "", nil
+	}
+	return k.Title, k.RenameInfo()
+}
+
+// findByIDInIndex is findByID's cache-backed twin, and the "replacing
+// findByID's full scan" the spec calls out: a prefix match against the
+// index's lightweight event records costs nothing per event beyond a
+// string comparison, with no body ever read for events that don't match.
+func findByIDInIndex(idx cache.Index, id string) (rec cache.EventRec, matches int) {
+	for _, er := range idx.Events {
+		if strings.HasPrefix(er.ID, id) {
+			rec = er
+			matches++
+		}
+	}
+	return rec, matches
+}
+
+// unionRecs dedupes recs by id across any number of selections - status's
+// per-key read needs the union of "notes for this key" (unbounded) and
+// "history for this key" (last 8, any type), which can overlap, and the
+// spec's "ONE Batch" means fetching each matched event's body exactly once
+// regardless of how many selections named it.
+func unionRecs(sets ...[]cache.EventRec) []cache.EventRec {
+	seen := make(map[string]bool)
+	var out []cache.EventRec
+	for _, set := range sets {
+		for _, r := range set {
+			if seen[r.ID] {
+				continue
+			}
+			seen[r.ID] = true
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// batchEventBodies fetches the full event.json body for each rec in ONE
+// batch call and decodes it back into a model.Event, restamping ID the way
+// eventsDAG/tailEvents do — an event's own JSON never carries its id (it's
+// the commit sha, assigned at read time), so a body read off a bare blob
+// sha needs it restored from the record that named the blob.
+//
+// The index already proved these specific blobs decode: BuildIndex and
+// ApplyTail only ever record an EventRec for an event that decoded
+// successfully during that same fold. A failure here is therefore a store
+// integrity problem - a blob the index's own base commit says exists but
+// this store cannot read - not a cache staleness one, so it surfaces as an
+// error rather than silently dropping the event from a render.
+func batchEventBodies(c *Ctx, recs []cache.EventRec) (map[string]model.Event, error) {
+	out := make(map[string]model.Event, len(recs))
+	if len(recs) == 0 {
+		return out, nil
+	}
+	shas := make([]string, len(recs))
+	for i, r := range recs {
+		shas[i] = r.BlobSha
+	}
+	objs, err := c.Store.Batch(shas)
+	if err != nil {
+		return nil, err
+	}
+	for i, r := range recs {
+		if i >= len(objs) || !objs[i].Present {
+			return nil, fmt.Errorf("event %s: blob %s missing from this store", r.ID, r.BlobSha)
+		}
+		var ev model.Event
+		if err := json.Unmarshal([]byte(objs[i].Content), &ev); err != nil {
+			return nil, fmt.Errorf("event %s: blob %s: %w", r.ID, r.BlobSha, err)
+		}
+		ev.ID = r.ID
+		out[r.ID] = ev
+	}
+	return out, nil
 }
 
 // spineLine renders one row for a TTY. Evidence-less values are marked, and
@@ -347,30 +483,74 @@ func newStatusCmd(c *Ctx) *cobra.Command {
 	return cmd
 }
 
+// runStatus dispatches to the cached fast path (dgd-265) or the ordinary
+// whole-chain fold. --by-branch always folds - it needs every SET event's
+// body (byBranchRows), which the index deliberately does not carry - so
+// only the plain global and per-key reads ever attempt the cache.
 func runStatus(c *Ctx, key, field string, byBranch bool, ledgerFlag string) error {
-	led, err := c.PickLedger(ledgerFlag)
+	if byBranch {
+		led, err := c.PickLedger(ledgerFlag)
+		if err != nil {
+			return err
+		}
+		return runStatusAllFolded(c, led, field, true)
+	}
+	p, idx, ok, err := c.cachedRead(ledgerFlag)
 	if err != nil {
 		return err
 	}
-
-	if key == "" {
-		var rows []row
-		if byBranch {
-			rows = byBranchRows(led, field)
-		} else {
-			rows = spineRows(led, field)
+	if ok {
+		if key == "" {
+			return runStatusAllCached(c, p, idx, field)
 		}
-		payload := map[string]any{"ledger": led.Slug, "scope": led.Meta.Scope, "state": led.State, "rows": rows}
-		c.attachFreshness(led, payload)
-		lines := addRedirect(c, led, payload)
-		lines = append(lines, fmt.Sprintf("%s  scope=%s  state=%s", led.Slug, led.Meta.Scope, led.State))
-		for _, r := range rows {
-			lines = append(lines, spineLine(r))
-		}
-		outEmit(c, payload, lines)
-		return nil
+		return runStatusKeyCached(c, p, idx, key, field)
 	}
+	led, err := c.Load(p.Slug)
+	if err != nil {
+		return err
+	}
+	if key == "" {
+		return runStatusAllFolded(c, led, field, false)
+	}
+	return runStatusKeyFolded(c, led, key, field)
+}
 
+func runStatusAllFolded(c *Ctx, led *fold.Ledger, field string, byBranch bool) error {
+	var rows []row
+	if byBranch {
+		rows = byBranchRows(led, field)
+	} else {
+		rows = spineRows(led, field)
+	}
+	payload := map[string]any{"ledger": led.Slug, "scope": led.Meta.Scope, "state": led.State, "rows": rows}
+	c.attachFreshness(led, payload)
+	lines := addRedirect(c, led, payload)
+	lines = append(lines, fmt.Sprintf("%s  scope=%s  state=%s", led.Slug, led.Meta.Scope, led.State))
+	for _, r := range rows {
+		lines = append(lines, spineLine(r))
+	}
+	outEmit(c, payload, lines)
+	return nil
+}
+
+// runStatusAllCached is runStatusAllFolded's cache-backed twin: rows come
+// straight off the index's spine (exactly what rowOf would have built,
+// stored inline), and the three scalars (scope/state/roots/redirect) come
+// off the projection - no event body is read at all.
+func runStatusAllCached(c *Ctx, p cache.Projection, idx cache.Index, field string) error {
+	rows := spineRowsFromIndex(idx, field)
+	payload := map[string]any{"ledger": p.Slug, "scope": p.Meta.Scope, "state": p.State, "rows": rows}
+	c.attachFreshnessFor(p.Slug, p.Roots, payload)
+	lines := addRedirectFor(c, p.SupersededBy, p.ExtraLinks, payload)
+	lines = append(lines, fmt.Sprintf("%s  scope=%s  state=%s", p.Slug, p.Meta.Scope, p.State))
+	for _, r := range rows {
+		lines = append(lines, spineLine(r))
+	}
+	outEmit(c, payload, lines)
+	return nil
+}
+
+func runStatusKeyFolded(c *Ctx, led *fold.Ledger, key, field string) error {
 	fields, ok := led.Spine[key]
 	if !ok {
 		hint := "known keys: " + strings.Join(knownKeys(led), ", ")
@@ -431,6 +611,94 @@ func runStatus(c *Ctx, key, field string, byBranch bool, ledgerFlag string) erro
 	return nil
 }
 
+// runStatusKeyCached is runStatusKeyFolded's cache-backed twin. Field
+// values come off the index's spine directly. Notes-for-key and the
+// 8-event history both need full bodies (text, fields, evidence) the index
+// deliberately doesn't carry, so their ids are selected off the index
+// alone and their bodies fetched in exactly ONE batch call, sized to
+// whatever the two selections actually need — never the whole chain.
+func runStatusKeyCached(c *Ctx, p cache.Projection, idx cache.Index, key, field string) error {
+	spine, ok := idx.Spine[key]
+	if !ok {
+		hint := "known keys: " + strings.Join(knownKeysFromIndex(idx), ", ")
+		return out.Errf("unknown_key", hint, 4, "no such key '%s' on '%s'", key, p.Slug)
+	}
+	values := map[string]row{}
+	fieldNames := make([]string, 0, len(spine))
+	for f, e := range spine {
+		if field != "" && f != field {
+			continue
+		}
+		values[f] = rowFromSpineEntry(key, f, e)
+		fieldNames = append(fieldNames, f)
+	}
+	sort.Strings(fieldNames)
+
+	var forKey []cache.EventRec
+	for _, er := range idx.Events {
+		if er.Key == key {
+			forKey = append(forKey, er)
+		}
+	}
+	var noteRecs []cache.EventRec
+	for _, er := range forKey {
+		if er.Type == "note" {
+			noteRecs = append(noteRecs, er)
+		}
+	}
+	historyRecs := forKey
+	if len(historyRecs) > 8 {
+		historyRecs = historyRecs[len(historyRecs)-8:]
+	}
+	bodies, err := batchEventBodies(c, unionRecs(noteRecs, historyRecs))
+	if err != nil {
+		return out.Errf("git_failed", "", 1, "%s", err)
+	}
+
+	committers, _ := c.Store.Committers(p.Slug)
+	notes := []noteDoc{}
+	var noteEvs []model.Event
+	for _, er := range noteRecs {
+		if ev, ok := bodies[er.ID]; ok {
+			notes = append(notes, noteDocOf(ev, committers))
+			noteEvs = append(noteEvs, ev)
+		}
+	}
+	history := make([]model.Event, 0, len(historyRecs))
+	for _, er := range historyRecs {
+		if ev, ok := bodies[er.ID]; ok {
+			history = append(history, ev)
+		}
+	}
+
+	payload := map[string]any{"ledger": p.Slug, "key": key, "values": values,
+		"notes": notes, "history": eventsJSON(history)}
+	title, renamed := titleFromBoard(p, key)
+	if title != "" {
+		payload["title"] = title
+		if renamed != nil {
+			payload["renamed"] = renamed
+		}
+	}
+	c.attachFreshnessFor(p.Slug, p.Roots, payload)
+
+	lines := addRedirectFor(c, p.SupersededBy, p.ExtraLinks, payload)
+	head := key + " on " + p.Slug
+	if title != "" {
+		head += `  "` + out.EscapeControls(title) + `"` + renamedMark(renamed)
+	}
+	lines = append(lines, head)
+	for _, f := range fieldNames {
+		lines = append(lines, spineLine(values[f]))
+	}
+	lines = append(lines, noteLines(noteEvs, committers, false, model.Now())...)
+	for _, ev := range history {
+		lines = append(lines, "  "+eventLine(ev))
+	}
+	outEmit(c, payload, lines)
+	return nil
+}
+
 // ---- show ----
 
 func init() { register(newShowCmd) }
@@ -446,14 +714,28 @@ func newShowCmd(c *Ctx) *cobra.Command {
 	return cmd
 }
 
+// runShow dispatches to the cached fast path (dgd-265) or the ordinary
+// whole-chain fold. --id is its own entry point (runShowID) with its own
+// dispatch, since it needs neither the spine nor the board.
 func runShow(c *Ctx, ledgerFlag string, whereRaw []string, idFlag string) error {
 	if idFlag != "" {
 		return runShowID(c, ledgerFlag, idFlag)
 	}
-	led, err := c.PickLedger(ledgerFlag)
+	p, idx, ok, err := c.cachedRead(ledgerFlag)
 	if err != nil {
 		return err
 	}
+	if ok {
+		return runShowCached(c, p, idx, whereRaw)
+	}
+	led, err := c.Load(p.Slug)
+	if err != nil {
+		return err
+	}
+	return runShowFolded(c, led, whereRaw)
+}
+
+func runShowFolded(c *Ctx, led *fold.Ledger, whereRaw []string) error {
 	clauses, err := parseWhere(whereRaw, led.Meta)
 	if err != nil {
 		return err
@@ -512,6 +794,95 @@ func runShow(c *Ctx, ledgerFlag string, whereRaw []string, idFlag string) error 
 	// The identity header carries the title history: a renamed title never
 	// renders unlabeled, here or on any row. Nothing at all on a board with
 	// no renames.
+	if renamedLines, renamedDocs := renamedKeys(b); renamedDocs != nil {
+		payload["renamed_keys"] = renamedDocs
+		lines = append(lines, renamedLines...)
+	}
+	for _, r := range rows {
+		lines = append(lines, spineLine(r))
+	}
+	for _, n := range recent {
+		lines = append(lines, noteSummaryLineAt(n.TS, n, committers))
+	}
+	outEmit(c, payload, lines)
+	return nil
+}
+
+// runShowCached is runShowFolded's cache-backed twin. Rows come off the
+// index's spine; Title/Renamed and --where's board.Key lookups come off the
+// projection's Board (already board.Build over the whole chain, kept
+// correct across every tail resume - see titleFromBoard); schema comes off
+// the index's resolved Schema; only the <=5 most recent notes' bodies are
+// ever fetched, in one batch call.
+func runShowCached(c *Ctx, p cache.Projection, idx cache.Index, whereRaw []string) error {
+	clauses, err := parseWhere(whereRaw, p.Meta)
+	if err != nil {
+		return err
+	}
+
+	rows := spineRowsFromIndex(idx, "")
+	ready := model.ReadyCapable(p.Meta)
+	b := p.Board
+	if ready {
+		for i := range rows {
+			if k, exists := b.Keys[rows[i].Key]; exists {
+				rows[i].Title, rows[i].Renamed = k.Title, k.RenameInfo()
+			}
+		}
+	}
+	if len(clauses) > 0 {
+		kept := []row{}
+		for _, r := range rows {
+			if matchWhere(b.Keys[r.Key], clauses) {
+				kept = append(kept, r)
+			}
+		}
+		rows = kept
+	}
+	committers, _ := c.Store.Committers(p.Slug)
+
+	var noteRecs []cache.EventRec
+	for _, er := range idx.Events {
+		if er.Type == "note" {
+			noteRecs = append(noteRecs, er)
+		}
+	}
+	recentRecs := noteRecs
+	if len(recentRecs) > 5 {
+		recentRecs = recentRecs[len(recentRecs)-5:]
+	}
+	bodies, err := batchEventBodies(c, recentRecs)
+	if err != nil {
+		return out.Errf("git_failed", "", 1, "%s", err)
+	}
+	recent := make([]model.Event, 0, len(recentRecs))
+	for _, er := range recentRecs {
+		if ev, ok := bodies[er.ID]; ok {
+			recent = append(recent, ev)
+		}
+	}
+	recentNotes := make([]map[string]any, 0, len(recent))
+	for _, n := range recent {
+		recentNotes = append(recentNotes, map[string]any{
+			"id": n.ID, "kind": n.Kind, "by": n.Author, "ts": n.TS, "first_line": firstLine(n.Text),
+		})
+	}
+
+	eventCount := len(idx.Events)
+	head := ""
+	if eventCount > 0 {
+		head = idx.Events[eventCount-1].ID
+	}
+	payload := map[string]any{
+		"ledger": p.Slug, "scope": p.Meta.Scope, "state": p.State, "rows": rows,
+		"schema": idx.Schema, "require_evidence": p.Meta.RequireEvidence, "recent_notes": recentNotes,
+		"events": eventCount, "head": head,
+	}
+	c.attachFreshnessFor(p.Slug, p.Roots, payload)
+
+	lines := addRedirectFor(c, p.SupersededBy, p.ExtraLinks, payload)
+	lines = append(lines, fmt.Sprintf("%s  scope=%s  base=%s  state=%s  events=%d  head=%s",
+		p.Slug, p.Meta.Scope, p.Meta.Base, p.State, eventCount, head))
 	if renamedLines, renamedDocs := renamedKeys(b); renamedDocs != nil {
 		payload["renamed_keys"] = renamedDocs
 		lines = append(lines, renamedLines...)
@@ -634,10 +1005,21 @@ func notesIDErr(slug, id string, ev model.Event, matches int) error {
 // one back in full; a ticket holder following a redirect must never land on
 // less than the event.
 func runShowID(c *Ctx, ledgerFlag, id string) error {
-	led, err := c.PickLedger(ledgerFlag)
+	p, idx, ok, err := c.cachedRead(ledgerFlag)
 	if err != nil {
 		return err
 	}
+	if ok {
+		return runShowIDCached(c, p, idx, id)
+	}
+	led, err := c.Load(p.Slug)
+	if err != nil {
+		return err
+	}
+	return runShowIDFolded(c, led, id)
+}
+
+func runShowIDFolded(c *Ctx, led *fold.Ledger, id string) error {
 	ev, matches := findByID(led.Events, id)
 	if matches != 1 {
 		return idReadErr(led.Slug, id, matches)
@@ -652,6 +1034,34 @@ func runShowID(c *Ctx, ledgerFlag, id string) error {
 	// on the rest of show.
 	c.attachFreshness(led, payload)
 	lines := addRedirect(c, led, payload)
+	lines = append(lines, showIDLines(ev, committers)...)
+	outEmit(c, payload, lines)
+	return nil
+}
+
+// runShowIDCached is runShowIDFolded's cache-backed twin, and the
+// "replacing findByID's full scan" the spec calls out: id resolution reads
+// only the index's lightweight event records (findByIDInIndex), and the
+// matched event's body is the only one ever fetched.
+func runShowIDCached(c *Ctx, p cache.Projection, idx cache.Index, id string) error {
+	rec, matches := findByIDInIndex(idx, id)
+	if matches != 1 {
+		return idReadErr(p.Slug, id, matches)
+	}
+	bodies, err := batchEventBodies(c, []cache.EventRec{rec})
+	if err != nil {
+		return out.Errf("git_failed", "", 1, "%s", err)
+	}
+	ev, ok := bodies[rec.ID]
+	if !ok {
+		return out.Errf("git_failed", "", 1, "event %s: body not found", rec.ID)
+	}
+	committers, _ := c.Store.Committers(p.Slug)
+	payload := eventJSON(ev)
+	payload["ledger"] = p.Slug
+	payload["via"] = committers[ev.ID]
+	c.attachFreshnessFor(p.Slug, p.Roots, payload)
+	lines := addRedirectFor(c, p.SupersededBy, p.ExtraLinks, payload)
 	lines = append(lines, showIDLines(ev, committers)...)
 	outEmit(c, payload, lines)
 	return nil
@@ -759,15 +1169,28 @@ func newNotesCmd(c *Ctx) *cobra.Command {
 	return cmd
 }
 
+// runNotes dispatches to the cached fast path (dgd-265) or the ordinary
+// whole-chain fold.
 func runNotes(c *Ctx, kind, key, id string, latest bool, limit int, ledgerFlag, at string) error {
 	now, err := resolveAt(at)
 	if err != nil {
 		return err
 	}
-	led, err := c.PickLedger(ledgerFlag)
+	p, idx, ok, err := c.cachedRead(ledgerFlag)
 	if err != nil {
 		return err
 	}
+	if ok {
+		return runNotesCached(c, p, idx, kind, key, id, latest, limit, now)
+	}
+	led, err := c.Load(p.Slug)
+	if err != nil {
+		return err
+	}
+	return runNotesFolded(c, led, kind, key, id, latest, limit, now)
+}
+
+func runNotesFolded(c *Ctx, led *fold.Ledger, kind, key, id string, latest bool, limit int, now time.Time) error {
 	matched := []model.Event{}
 	for _, n := range led.Notes() {
 		if kind != "" && n.Kind != kind {
@@ -806,6 +1229,66 @@ func runNotes(c *Ctx, kind, key, id string, latest bool, limit int, ledgerFlag, 
 	}
 	payload := map[string]any{"ledger": led.Slug, "notes": docs}
 	lines := addRedirect(c, led, payload)
+	lines = append(lines, noteLines(matched, committers, latest, now)...)
+	outEmit(c, payload, lines)
+	return nil
+}
+
+// runNotesCached is runNotesFolded's cache-backed twin, and the case the
+// framing's correction was about: kind/key/id selection reads only the
+// index's lightweight event records - no body - and the limit/--latest
+// truncation happens on THAT selection, before the one batch fetch that
+// gets bodies for exactly the page actually rendered. The board's eleven
+// per-render notes calls, ten of which sweep by kind across the whole
+// ledger with no --key, are exactly this shape.
+func runNotesCached(c *Ctx, p cache.Projection, idx cache.Index, kind, key, id string, latest bool, limit int, now time.Time) error {
+	var matchedRecs []cache.EventRec
+	for _, er := range idx.Events {
+		if er.Type != "note" {
+			continue
+		}
+		if kind != "" && er.Kind != kind {
+			continue
+		}
+		if key != "" && er.Key != key {
+			continue
+		}
+		if id != "" && !strings.HasPrefix(er.ID, id) {
+			continue
+		}
+		matchedRecs = append(matchedRecs, er)
+	}
+	if id != "" && len(matchedRecs) == 0 {
+		rec, m := findByIDInIndex(idx, id)
+		if m != 1 || rec.Type != "note" {
+			return notesIDErr(p.Slug, id, model.Event{Type: rec.Type}, m)
+		}
+	}
+	n := limit
+	if latest {
+		n = 1
+	}
+	if n > 0 && len(matchedRecs) > n {
+		matchedRecs = matchedRecs[len(matchedRecs)-n:]
+	}
+	bodies, err := batchEventBodies(c, matchedRecs)
+	if err != nil {
+		return out.Errf("git_failed", "", 1, "%s", err)
+	}
+	matched := make([]model.Event, 0, len(matchedRecs))
+	for _, er := range matchedRecs {
+		if ev, ok := bodies[er.ID]; ok {
+			matched = append(matched, ev)
+		}
+	}
+
+	committers, _ := c.Store.Committers(p.Slug)
+	docs := make([]noteDoc, 0, len(matched))
+	for _, note := range matched {
+		docs = append(docs, noteDocOf(note, committers))
+	}
+	payload := map[string]any{"ledger": p.Slug, "notes": docs}
+	lines := addRedirectFor(c, p.SupersededBy, p.ExtraLinks, payload)
 	lines = append(lines, noteLines(matched, committers, latest, now)...)
 	outEmit(c, payload, lines)
 	return nil

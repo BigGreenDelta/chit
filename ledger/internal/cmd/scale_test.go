@@ -74,15 +74,20 @@ func seedReadyBoard(t *testing.T, dir, slug string, evs []model.Event) store.Sto
 	}
 	scaletest.Seed(t, s.Repo, slug, evs, map[string]string{"meta.json": string(metaJSON)})
 	s.Repo.Git("", "gc", "--quiet")
-	// Mint the fold cache off the seeded chain, once, before any caller
-	// starts counting bytes. A live ledger always has one: the write path
-	// mints it on the first append that finds the ref absent and refreshes
-	// it every cache.CacheEvery commits after that. A fixture without one
-	// would fold the chain from root a second time inside the very first
-	// measured write - a cost production pays once per ledger, never per
-	// write - and every cost assertion below would be measuring that mint
-	// rather than the precondition read it is about.
+	// Mint BOTH fold caches off the seeded chain, once, before any caller
+	// starts counting bytes. A live ledger always has both (dgd-265 added
+	// the index ref alongside dgd-237's projection ref): the write path
+	// mints each independently on the first append that finds its own ref
+	// absent, and refreshes each independently after that. A fixture
+	// minting only one would fold the chain from root a second time inside
+	// the very first measured write - a cost production pays once per
+	// ledger per ref, never per write - and every cost assertion below
+	// would be measuring that second mint rather than the precondition
+	// read it is about.
 	if _, err := s.CacheSource(slug).Reset(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CacheIndexSource(slug).Reset(); err != nil {
 		t.Fatal(err)
 	}
 	return s
@@ -215,14 +220,21 @@ func TestSetPreconditionWholeChainCost(t *testing.T) {
 
 	// wholeChainBytes brackets a single whole-chain fold (one `git log` plus
 	// one `cat-file --batch`) of ~5000 events plus the CAS loop's own small,
-	// constant-size calls. The floor rules out a regression back to a
+	// constant-size calls, PLUS - since dgd-265 - each of the two cache
+	// refs' own small, constant-size MaybeRefresh cadence check (a
+	// RevParse and a one-object Batch apiece, whether or not either
+	// actually refreshes). The floor rules out a regression back to a
 	// narrow window (which would move only tens of KB); the ceiling is
 	// generous headroom above the whole chain's measured size on this
 	// hardware (hardware-specific, per the task report's note on this
 	// sandbox's git/subprocess overhead) — the assertion is on SHAPE (both
-	// cases cost the same), not a tight byte count.
+	// cases cost the same), not a tight byte count. Raised from 4_500_000
+	// to 6_000_000 when the index cache ref's own cadence check landed
+	// (measured here at ~4.99M against seedReadyBoard's fixture, which
+	// pre-mints both refs so this counts only the per-write cadence check,
+	// never a mint - see seedReadyBoard's own comment).
 	const minBytes = 500_000
-	const maxBytes = 4_500_000
+	const maxBytes = 6_000_000
 	assertWholeChainCost := func(t *testing.T, label string, byteCount int64) {
 		t.Helper()
 		if byteCount < minBytes || byteCount > maxBytes {

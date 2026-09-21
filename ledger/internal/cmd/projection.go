@@ -110,3 +110,39 @@ func (c *Ctx) PickIndex(ledgerFlag string) (cache.Index, error) {
 	}
 	return c.LoadIndex(p.Slug)
 }
+
+// cachedRead is status/show/notes' fast-path check: the ledger, resolved
+// exactly as PickProjection (and, since they share resolution rules,
+// PickLedger) would resolve it, plus a cheap yes/no on whether BOTH cache
+// refs describe that ledger's HEAD right now.
+//
+// err is the resolution error alone (unknown/ambiguous/no-open-ledger) -
+// identical to what PickLedger would return for the same flag, since
+// PickProjection's own doc comment guarantees the two never drift. p is
+// always meaningful when err is nil, regardless of ok: PickProjection's
+// Store.Projection call already had to settle for a root fold or it
+// wouldn't have an answer at all, and p.Slug is exactly the ledger a
+// caller's own fallback fold should target - never re-run the ambient
+// "which ledger is open" search a second time.
+//
+// ok is true only when p's own read did NOT need a root fold (p.Origin !=
+// OriginRoot - cheap to check, already computed) AND the index ref's cheap
+// TryRead lands on that exact same base. Either ref alone being stale, or
+// the two resolving to different bases (the two-refs-can-disagree gap the
+// design gate asked to close), falls through to ok=false: a verb must
+// never mix a cache answer from one head with an index answer from
+// another.
+func (c *Ctx) cachedRead(ledgerFlag string) (cache.Projection, cache.Index, bool, error) {
+	p, err := c.PickProjection(ledgerFlag)
+	if err != nil {
+		return cache.Projection{}, cache.Index{}, false, err
+	}
+	if p.Origin == cache.OriginRoot {
+		return p, cache.Index{}, false, nil
+	}
+	ix, ok := c.Store.CacheIndexSource(p.Slug).TryRead()
+	if !ok || ix.Base != p.Base {
+		return p, cache.Index{}, false, nil
+	}
+	return p, ix, true, nil
+}
