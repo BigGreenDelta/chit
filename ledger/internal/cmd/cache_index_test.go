@@ -247,3 +247,204 @@ func TestIndexResetAndVerifyRoundTrip(t *testing.T) {
 		t.Fatalf("verify must name the index difference: %s", so)
 	}
 }
+
+// TestCacheVerifyFailsOnAnIndexRefPointingAtANonBlob is the index's
+// counterpart to TestCacheVerifyFailsOnARefPointingAtANonBlob: a ref
+// pointing at a commit sha, not a blob at all, is a difference, never a
+// clean "no cache" answer.
+func TestCacheVerifyFailsOnAnIndexRefPointingAtANonBlob(t *testing.T) {
+	dir := initRepo(t)
+	res, err := store.Resolve(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedBoard(t, dir, "board")
+	mustRun(t, dir, "set", "k-1", "status=open", "--expect", "none", "--ledger", "board", "-m", "one", "--as", "alice")
+	f := cacheFixture{"index-non-blob", dir, "board", res.Store}
+	resetBothRefs(t, f)
+
+	head, ok := res.Store.FullHead("board")
+	if !ok {
+		t.Fatal("no head")
+	}
+	if err := res.Store.UpdateRefForce(store.CacheIndexRef("board"), head); err != nil {
+		t.Fatal(err)
+	}
+
+	so, _, code := run(t, dir, "cache", "verify", "board")
+	if code == 0 {
+		t.Fatalf("an index ref pointing at a commit must not verify clean: %s", so)
+	}
+	if !strings.Contains(so, "cache_unreadable") || !strings.Contains(so, "not a blob") {
+		t.Fatalf("verify must say the index ref is not a cache blob: %s", so)
+	}
+}
+
+// ---------------------------------------------------------------------
+// Criterion 7's degradation matrix, at the index level: mirrors
+// TestCacheIgnoredWhenBaseIsAheadOfHead / RangeHoldsAMerge / TailExceedsBound
+// / SchemaVersionDiffers (cache_test.go) for the index ref. Foreign base and
+// plain absence are already covered above
+// (TestIndexIgnoredWhenBaseIsForeign, TestIndexResetAndVerifyRoundTrip's
+// reset-from-absent path).
+// ---------------------------------------------------------------------
+
+// TestIndexIgnoredWhenBaseIsAheadOfHead: a peer's index cache arriving
+// before the commits it describes must be ignored, not walked toward - the
+// walk runs from head BACKWARD, so a base ahead of head is simply never
+// reached.
+func TestIndexIgnoredWhenBaseIsAheadOfHead(t *testing.T) {
+	dir := initRepo(t)
+	res, err := store.Resolve(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := res.Store
+	seedBoard(t, dir, "board")
+	mustRun(t, dir, "set", "k-1", "status=open", "--expect", "none", "--ledger", "board", "-m", "one", "--as", "alice")
+	behind, ok := s.FullHead("board")
+	if !ok {
+		t.Fatal("no head")
+	}
+	mustRun(t, dir, "set", "k-2", "status=open", "--expect", "none", "--ledger", "board", "-m", "two", "--as", "alice")
+
+	f := cacheFixture{"index-ahead", dir, "board", s}
+	mustResetIndex(t, f) // index base is now the newer head
+	if err := s.UpdateRefForce(store.Ref("board"), behind); err != nil {
+		t.Fatal(err)
+	}
+	mustIndexOrigin(t, f, cache.OriginRoot)
+}
+
+// TestIndexIgnoredWhenRangeHoldsAMerge is the index's counterpart to the
+// same-named projection test: a merge inside base..head attaches to the
+// cached prefix's interior, and the walk refuses it exactly the same way
+// regardless of which blob schema is behind it.
+func TestIndexIgnoredWhenRangeHoldsAMerge(t *testing.T) {
+	dir := initRepo(t)
+	res, err := store.Resolve(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := res.Store
+	m := scaletest.Meta()
+	m.Slug, m.Scope, m.Created, m.CreatedBy = "board", "cache test", "2026-08-01T00:00:00.000", "t"
+	m.FieldOrder = []string{"status"}
+	mj, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := scaletest.Churn(60)
+	scaletest.SeedMerged(t, s.Repo, "board", base,
+		scaletest.Branch(200, 20, "alice"), scaletest.Branch(200, 20, "bob"),
+		map[string]string{"meta.json": string(mj)})
+
+	f := cacheFixture{"index-merge-in-range", dir, "board", s}
+	merge := strings.TrimSpace(gitOutput(t, s, "rev-list", "--merges", "--max-count=1", store.Ref("board")))
+	if merge == "" {
+		t.Fatal("fixture: no merge commit in the seeded chain")
+	}
+	parents := strings.Fields(strings.TrimSpace(gitOutput(t, s, "rev-list", "--parents", "--max-count=1", merge)))
+	if len(parents) != 3 {
+		t.Fatalf("fixture: merge %s has parents %v", merge, parents)
+	}
+	baseTip := strings.TrimSpace(gitOutput(t, s, "merge-base", parents[1], parents[2]))
+	if baseTip == "" {
+		t.Fatal("fixture: could not locate the pre-merge commit")
+	}
+	ix, err := s.CacheIndexSource("board").FoldIndex(baseTip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := cache.EncodeIndex(ix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha, err := s.WriteObject("blob", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateRefForce(store.CacheIndexRef("board"), sha); err != nil {
+		t.Fatal(err)
+	}
+	mustIndexOrigin(t, f, cache.OriginRoot)
+}
+
+// TestIndexIgnoredWhenTailExceedsTheBound: past WalkBound the index cache
+// is ignored, so a stale index can never turn a cheap read into a long one.
+func TestIndexIgnoredWhenTailExceedsTheBound(t *testing.T) {
+	if testing.Short() {
+		t.Skip("cache bound")
+	}
+	dir := initRepo(t)
+	res, err := store.Resolve(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := res.Store
+	m := scaletest.Meta()
+	m.Slug, m.Scope, m.Created, m.CreatedBy = "board", "cache test", "2026-08-01T00:00:00.000", "t"
+	m.FieldOrder = []string{"status"}
+	mj, _ := json.Marshal(m)
+	all := scaletest.Churn(cache.WalkBound + 60)
+	scaletest.Seed(t, s.Repo, "board", all, map[string]string{"meta.json": string(mj)})
+
+	f := cacheFixture{"index-over-bound", dir, "board", s}
+	root := s.Roots(store.Ref("board"))
+	if len(root) != 1 {
+		t.Fatalf("fixture: want one root, got %v", root)
+	}
+	ix, err := s.CacheIndexSource("board").FoldIndex(root[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := cache.EncodeIndex(ix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha, err := s.WriteObject("blob", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateRefForce(store.CacheIndexRef("board"), sha); err != nil {
+		t.Fatal(err)
+	}
+	mustIndexOrigin(t, f, cache.OriginRoot)
+}
+
+// TestIndexIgnoredWhenSchemaVersionDiffers: a future index version is
+// ignored exactly like an absent ref, never misread.
+func TestIndexIgnoredWhenSchemaVersionDiffers(t *testing.T) {
+	dir := initRepo(t)
+	res, err := store.Resolve(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := res.Store
+	seedBoard(t, dir, "board")
+	mustRun(t, dir, "set", "k-1", "status=open", "--expect", "none", "--ledger", "board", "-m", "one", "--as", "alice")
+	f := cacheFixture{"index-version", dir, "board", s}
+	mustResetIndex(t, f)
+
+	head, _ := s.FullHead("board")
+	ix, err := s.CacheIndexSource("board").FoldIndex(head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := cache.EncodeIndex(ix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bumped := strings.Replace(string(raw), `{"v":1,`, `{"v":99,`, 1)
+	if bumped == string(raw) {
+		t.Fatalf("fixture: the version field is not where this test expects it: %s", raw[:40])
+	}
+	sha, err := s.WriteObject("blob", []byte(bumped))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateRefForce(store.CacheIndexRef("board"), sha); err != nil {
+		t.Fatal(err)
+	}
+	mustIndexOrigin(t, f, cache.OriginRoot)
+}
