@@ -38,7 +38,13 @@ Three facts an admin needs:
 - It is **derived**. It holds no event that `refs/ledger/<slug>` does not
   hold. Deleting it costs nothing but speed, and `chit cache reset <slug>`
   rebuilds it. `chit cache verify <slug>` re-folds from root and byte-
-  compares, exiting non-zero if they differ.
+  compares. It exits 0 in exactly two cases: there is no cache ref, or the
+  ref is a cache blob a fold from root reproduces byte for byte. Every
+  other shape exits 5 and names what differs - readable but wrong,
+  undecodable, or a ref pointing at something that is not a cache blob at
+  all (a commit sha, say). Absence is the only clean non-cache: a store
+  that has never written one must not look corrupt, or the check could not
+  be run unconditionally.
 - It is **force-updated**, and `chit push` force-pushes it - the one
   exception to chit's otherwise non-force push. A remote with
   `receive.denyNonFastForwards` set will therefore reject the cache ref on

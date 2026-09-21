@@ -32,7 +32,13 @@ func newCacheCmd(c *Ctx) *cobra.Command {
 			"  - the CACHED READ at head against a from-root fold at head, which is what\n" +
 			"    catches the tail resume producing a different board from the fold it is\n" +
 			"    supposed to reproduce.\n" +
-			"Exits 5 and names the first differing byte if either comparison differs.",
+			"\n" +
+			"Exit 0 means one of exactly two things: there is no cache ref, or the ref\n" +
+			"is a cache blob a fold from root reproduces byte for byte. Anything else\n" +
+			"exits 5 and names what differs - a blob that is readable but wrong, one\n" +
+			"this binary cannot decode, or a ref pointing at something that is not a\n" +
+			"cache blob at all. This is a differential test meant to be run by a\n" +
+			"script, so it answers through its exit status and not only through JSON.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error { return runCacheVerify(c, args[0]) }}
 	cmd.AddCommand(reset, verify)
@@ -66,6 +72,15 @@ func runCacheVerify(c *Ctx, slug string) error {
 		// No ref claims anything, so nothing can be wrong. Exit 0: a store
 		// that has simply never written a cache must not look like a
 		// corrupt one, or `cache verify` cannot be run unconditionally.
+		//
+		// This branch is ABSENCE only. A ref that exists and points at
+		// something that is not a cache blob used to land here too, and so
+		// reported "no cache ref" and exited 0 - the same answer as a clean
+		// store, for a ref somebody had hand-written over. Verify now
+		// returns that as a cache_unreadable difference instead (exit 5):
+		// the read path is right to ignore such a ref, but ignoring it is
+		// precisely the thing an operator asked this verb to tell them
+		// about. See cache.ErrUnreadableCache for why the two part here.
 		outEmit(c, map[string]any{"ledger": slug, "ref": store.CacheRef(slug), "cache": nil,
 			"differences": []any{}},
 			[]string{slug + "  no cache ref - nothing to verify (chit cache reset " + slug + " builds one)"})

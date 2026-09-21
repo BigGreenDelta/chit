@@ -99,6 +99,20 @@ const (
 // ErrNoCache is Load's miss. Callers degrade; they never surface it.
 var ErrNoCache = errors.New("no_cache")
 
+// UnreadableCacheError is the narrower miss where the ref EXISTS but the
+// object under it is not a cache blob at all - a commit sha, a tree, an
+// object this store does not have. It unwraps to ErrNoCache, so every READ
+// path degrades on it exactly as it degrades on absence: presence of a ref
+// is never trust. `cache verify` is the one caller that tells the two
+// apart, because they are different claims. Absence claims nothing and
+// cannot be wrong. A ref in this namespace pointing at a non-blob is a
+// claim, and it is false - nothing that writes this namespace produces
+// one, so something else wrote it.
+type UnreadableCacheError struct{ Sha, Reason string }
+
+func (e *UnreadableCacheError) Error() string { return e.Reason }
+func (e *UnreadableCacheError) Unwrap() error { return ErrNoCache }
+
 // Blob is the cache blob's schema, v1. Every field is derived from the
 // chain and nothing is derived from the clock: there is no generated_at, no
 // host, no duration. Two folds of the same sha must produce identical
@@ -262,8 +276,13 @@ func (s Source) LoadRaw() ([]byte, string, error) {
 	if err != nil {
 		return nil, sha, err
 	}
-	if len(objs) != 1 || !objs[0].Present || objs[0].Type != "blob" {
-		return nil, sha, fmt.Errorf("%w: %s is not a readable blob", ErrNoCache, sha)
+	if len(objs) != 1 || !objs[0].Present {
+		return nil, sha, &UnreadableCacheError{Sha: sha,
+			Reason: fmt.Sprintf("%s is missing from this store", sha)}
+	}
+	if objs[0].Type != "blob" {
+		return nil, sha, &UnreadableCacheError{Sha: sha,
+			Reason: fmt.Sprintf("%s is a %s, not a blob", sha, objs[0].Type)}
 	}
 	return []byte(objs[0].Content), sha, nil
 }
@@ -540,8 +559,14 @@ type Diff struct {
 //     catches the resume itself - a tail fold that produces a different
 //     board from the fold it is supposed to reproduce.
 //
-// A missing cache ref is not a difference: nothing is claimed, so nothing
-// can be wrong.
+// The exit contract this feeds, stated once here because it is what makes
+// the verb usable by something that is not a human reading JSON: verify
+// reports no differences if and only if the ref is ABSENT, or the ref is a
+// cache blob that a fold from root reproduces byte for byte. Every other
+// shape - readable but wrong, undecodable, a commit sha, a slug that names
+// another ledger - is a difference. A missing ref is the one exemption:
+// nothing is claimed, so nothing can be wrong, and `cache verify` must stay
+// runnable unconditionally on a store that has never written a cache.
 func (s Source) Verify() ([]Diff, error) {
 	head, ok := s.Git.RevParse(s.LedgerRef)
 	if !ok {
@@ -550,6 +575,15 @@ func (s Source) Verify() ([]Diff, error) {
 	var diffs []Diff
 	raw, sha, err := s.LoadRaw()
 	if err != nil {
+		// Order matters: UnreadableCacheError unwraps to ErrNoCache, so
+		// the narrower case is tested first. A ref that exists and is not
+		// a cache blob is a difference, not an absence - see that type's
+		// own comment for why the two part here and nowhere else.
+		var ue *UnreadableCacheError
+		if errors.As(err, &ue) {
+			return []Diff{{What: "cache_unreadable",
+				Detail: fmt.Sprintf("%s points at an object that is not a cache blob: %s", s.CacheRef, ue.Reason)}}, nil
+		}
 		if errors.Is(err, ErrNoCache) {
 			return nil, ErrNoCache
 		}

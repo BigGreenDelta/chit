@@ -528,6 +528,123 @@ func TestCacheVerifyOnAStoreWithNoCacheRefIsClean(t *testing.T) {
 	}
 }
 
+// TestCacheVerifyFailsOnARefPointingAtANonBlob is the second corruption
+// shape of criterion 5, and the first one anybody actually tries: point
+// the ref at a commit sha with git update-ref. It used to report
+// `"cache": null, "differences": []` and exit 0 - the same answer a store
+// that has never written a cache gives - so a script could not tell a
+// hand-written ref from a clean one. Absence is the ONLY thing that exits
+// 0 now; a ref that exists and is not a cache blob is a difference.
+func TestCacheVerifyFailsOnARefPointingAtANonBlob(t *testing.T) {
+	dir := initRepo(t)
+	res, err := store.Resolve(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := cacheFixture{"non-blob", dir, "board", res.Store}
+	seedBoard(t, dir, "board")
+	mustRun(t, dir, "set", "k-1", "status=open", "--expect", "none", "--ledger", "board", "-m", "one", "--as", "alice")
+	mustReset(t, f)
+
+	head, ok := res.Store.FullHead("board")
+	if !ok {
+		t.Fatal("no head")
+	}
+	git(t, dir, "update-ref", store.CacheRef("board"), head)
+
+	so, _, code := run(t, dir, "cache", "verify", "board")
+	if code == 0 {
+		t.Fatalf("a ref pointing at a commit must not verify clean: %s", so)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(so), &doc); err != nil {
+		t.Fatalf("verify payload is not JSON: %v\n%s", err, so)
+	}
+	diffs, _ := doc["differences"].([]any)
+	if len(diffs) == 0 {
+		t.Fatalf("verify must NAME what is wrong, not only exit non-zero: %s", so)
+	}
+	if !strings.Contains(so, "cache_unreadable") || !strings.Contains(so, "not a blob") {
+		t.Fatalf("verify must say the ref is not a cache blob: %s", so)
+	}
+
+	// And the safety property survives this shape too: a forged ref makes
+	// the read slower, never different.
+	want := readyJSON(t, f)
+	deleteCacheRef(t, f)
+	if got := readyJSON(t, f); got != want {
+		t.Fatal("a ref pointing at a commit must not change what ready answers")
+	}
+}
+
+// TestCacheVerifyExitStatusThroughTheBuiltBinary runs the three outcomes
+// through os/exec rather than in-process ExecuteArgs. The verb's whole
+// point is to be runnable by something that is not a human reading JSON,
+// and what that caller sees is a process exit status - which is one
+// os.Exit plumbing step further out than every other test here measures.
+func TestCacheVerifyExitStatusThroughTheBuiltBinary(t *testing.T) {
+	dir := initRepo(t)
+	res, err := store.Resolve(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := cacheFixture{"exec", dir, "board", res.Store}
+	seedBoard(t, dir, "board")
+	mustRun(t, dir, "set", "k-1", "status=open", "--expect", "none", "--ledger", "board", "-m", "one", "--as", "alice")
+
+	// 1. no ref at all: clean, exit 0.
+	deleteCacheRef(t, f)
+	if so, se, code := execLedger(t, dir, "cache", "verify", "board"); code != 0 {
+		t.Fatalf("no cache ref must exit 0, got %d\n%s%s", code, so, se)
+	}
+
+	// 2. a cache this store just built: clean, exit 0.
+	if so, se, code := execLedger(t, dir, "cache", "reset", "board"); code != 0 {
+		t.Fatalf("cache reset: %d\n%s%s", code, so, se)
+	}
+	if so, se, code := execLedger(t, dir, "cache", "verify", "board"); code != 0 {
+		t.Fatalf("a freshly reset cache must exit 0, got %d\n%s%s", code, so, se)
+	}
+
+	// 3. readable, decodable, still claiming the head - and wrong in one
+	// field. The shape a `sed` over a dumped blob produces.
+	head, ok := res.Store.FullHead("board")
+	if !ok {
+		t.Fatal("no head")
+	}
+	p, err := res.Store.CacheSource("board").Fold(head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := cache.Encode(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt := strings.Replace(string(raw), `"count":`, `"count": 999999, "count_orig":`, 1)
+	if corrupt == string(raw) {
+		t.Fatalf("fixture: nothing was corrupted in %s", raw)
+	}
+	forged, err := res.Store.WriteObject("blob", []byte(corrupt))
+	if err != nil {
+		t.Fatal(err)
+	}
+	git(t, dir, "update-ref", store.CacheRef("board"), forged)
+
+	so, se, code := execLedger(t, dir, "cache", "verify", "board")
+	if code != 5 {
+		t.Fatalf("a readable-but-wrong blob must exit 5 as a PROCESS, got %d\n%s%s", code, so, se)
+	}
+	if !strings.Contains(so, "cache_differs") {
+		t.Fatalf("verify must name cache_differs: %s", so)
+	}
+
+	// 4. and the shape that used to exit 0.
+	git(t, dir, "update-ref", store.CacheRef("board"), head)
+	if so, se, code := execLedger(t, dir, "cache", "verify", "board"); code != 5 {
+		t.Fatalf("a ref pointing at a commit must exit 5 as a PROCESS, got %d\n%s%s", code, so, se)
+	}
+}
+
 // TestCacheResetRebuildsFromRoot: `chit cache reset` drops the ref and
 // mints a fresh one, and the result verifies.
 func TestCacheResetRebuildsFromRoot(t *testing.T) {
