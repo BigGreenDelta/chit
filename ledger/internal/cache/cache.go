@@ -267,12 +267,18 @@ func decode(raw []byte) (Projection, error) {
 }
 
 // LoadRaw reads the cache ref's blob bytes, unvalidated.
-func (s Source) LoadRaw() ([]byte, string, error) {
-	sha, ok := s.Git.RevParse(s.CacheRef)
+func (s Source) LoadRaw() ([]byte, string, error) { return loadRawBlob(s.Git, s.CacheRef) }
+
+// loadRawBlob is LoadRaw's mechanism, generalized over the ref: dgd-265's
+// index blob lives under a second ref (refs/ledger-cache-index/<slug>) and
+// reads it exactly the same way - a cache ref is a cache ref regardless of
+// which schema its blob carries.
+func loadRawBlob(g Git, ref string) ([]byte, string, error) {
+	sha, ok := g.RevParse(ref)
 	if !ok {
 		return nil, "", ErrNoCache
 	}
-	objs, err := s.Git.Batch([]string{sha})
+	objs, err := g.Batch([]string{sha})
 	if err != nil {
 		return nil, sha, err
 	}
@@ -303,30 +309,49 @@ func (s Source) LoadRaw() ([]byte, string, error) {
 // pushed blob is trusted only insofar as this history can demonstrate it
 // describes its own prefix.
 func (s Source) Read() (Projection, error) {
+	if p, ok := s.TryRead(); ok {
+		return p, nil
+	}
 	head, ok := s.Git.RevParse(s.LedgerRef)
 	if !ok {
 		return s.Fold(s.LedgerRef) // unknown ledger: let the folder say so
 	}
+	return s.Fold(head)
+}
+
+// TryRead is Read's cache-only half: every branch Read falls back to
+// s.Fold(...) on returns ok=false here instead of paying for a root fold.
+// dgd-265 needs this split because a verb reading TWO cache refs (this
+// blob plus the sibling index) must be able to ask "would each of you hit,
+// on its own, without folding" before committing to either answer - see
+// store.CachedRead. Read itself is exactly this plus the one fallback
+// every failure here shares.
+func (s Source) TryRead() (Projection, bool) {
+	head, ok := s.Git.RevParse(s.LedgerRef)
+	if !ok {
+		return Projection{}, false
+	}
 	raw, _, err := s.LoadRaw()
 	if err != nil {
-		return s.Fold(head)
+		return Projection{}, false
 	}
 	p, err := decode(raw)
 	if err != nil || p.Slug != s.Slug || !p.HasMeta {
-		return s.Fold(head)
+		return Projection{}, false
 	}
 	if p.Base == head {
 		p.Origin = OriginCache
-		return p, nil
+		return p, true
 	}
-	tailSHAs, ok := s.walk(head, p.Base, WalkBound)
+	tailSHAs, ok := walkChain(s.Git, head, p.Base, WalkBound)
 	if !ok {
-		return s.Fold(head)
+		return Projection{}, false
 	}
-	evs, err := s.tailEvents(tailSHAs)
+	tail, err := fetchTailEvents(s.Git, tailSHAs)
 	if err != nil {
-		return s.Fold(head)
+		return Projection{}, false
 	}
+	evs := tailEventList(tail)
 	p.Board.ApplyTail(evs, p.Count)
 	p.Board.AdvanceContests(evs)
 	advanceState(&p, evs)
@@ -336,7 +361,7 @@ func (s Source) Read() (Projection, error) {
 	}
 	p.Base = head
 	p.Origin = OriginTail
-	return p, nil
+	return p, true
 }
 
 // advanceState folds the tail's non-`set` events into the three scalars
@@ -378,6 +403,13 @@ func advanceState(p *Projection, evs []model.Event) {
 // what would let dag.Sort interleave new commits into the cached order) and
 // a root reached without ever meeting base (a foreign or rewritten base).
 func (s Source) walk(head, base string, bound int) ([]string, bool) {
+	return walkChain(s.Git, head, base, bound)
+}
+
+// walkChain is walk's mechanism, freed of Source so IndexSource's own
+// TryRead can prove the identical attachment condition against its own
+// blob's base without a second copy of the walk.
+func walkChain(g Git, head, base string, bound int) ([]string, bool) {
 	cur := head
 	chain := make([]string, 0, bound)
 	for i := 0; i < bound; i++ {
@@ -387,7 +419,7 @@ func (s Source) walk(head, base string, bound int) ([]string, bool) {
 			}
 			return chain, true
 		}
-		parents, ok := s.parentsOf(cur)
+		parents, ok := parentsOfCommit(g, cur)
 		if !ok || len(parents) != 1 {
 			return nil, false
 		}
@@ -397,11 +429,11 @@ func (s Source) walk(head, base string, bound int) ([]string, bool) {
 	return nil, false
 }
 
-// parentsOf reads one commit object off the batch reader and returns its
-// parent shas. Commit headers end at the first blank line; parents are the
-// "parent <sha>" lines among them, in order.
-func (s Source) parentsOf(sha string) ([]string, bool) {
-	objs, err := s.Git.Batch([]string{sha})
+// parentsOfCommit reads one commit object off the batch reader and returns
+// its parent shas. Commit headers end at the first blank line; parents are
+// the "parent <sha>" lines among them, in order.
+func parentsOfCommit(g Git, sha string) ([]string, bool) {
+	objs, err := g.Batch([]string{sha})
 	if err != nil || len(objs) != 1 || !objs[0].Present || objs[0].Type != "commit" {
 		return nil, false
 	}
@@ -417,6 +449,16 @@ func (s Source) parentsOf(sha string) ([]string, bool) {
 	return parents, true
 }
 
+// tailEvent pairs a decoded, sentinel-filtered event with the git blob sha
+// its event.json content came from. The projection's tail application only
+// ever needed the event; the index's Events record needs the blob sha too,
+// so the batch read that fetches one fetches both rather than costing a
+// second pass over the same commits.
+type tailEvent struct {
+	Event   model.Event
+	BlobSha string
+}
+
 // tailEvents reads the tail's event.json blobs in ONE batch and applies
 // store.eventsDAG's sentinel rules verbatim: a commit whose event.json is
 // missing or unparseable, or whose event type is "sync", is contracted out
@@ -425,6 +467,27 @@ func (s Source) parentsOf(sha string) ([]string, bool) {
 // ids are what every contest and rename record in the cached prefix already
 // holds.
 func (s Source) tailEvents(shas []string) ([]model.Event, error) {
+	tail, err := fetchTailEvents(s.Git, shas)
+	if err != nil {
+		return nil, err
+	}
+	return tailEventList(tail), nil
+}
+
+func tailEventList(tail []tailEvent) []model.Event {
+	evs := make([]model.Event, len(tail))
+	for i, te := range tail {
+		evs[i] = te.Event
+	}
+	return evs
+}
+
+// fetchTailEvents is tailEvents' mechanism, freed of Source: the OID a
+// "sha:event.json" cat-file request resolves to IS the event.json blob's
+// own sha, at no extra cost - git cat-file --batch's header line names the
+// resolved object, not the commit fed in. Capturing it here is what lets
+// dgd-265's index carry a blob_sha per event without a second batch pass.
+func fetchTailEvents(g Git, shas []string) ([]tailEvent, error) {
 	if len(shas) == 0 {
 		return nil, nil
 	}
@@ -432,14 +495,14 @@ func (s Source) tailEvents(shas []string) ([]model.Event, error) {
 	for i, sha := range shas {
 		reqs[i] = sha + ":event.json"
 	}
-	objs, err := s.Git.Batch(reqs)
+	objs, err := g.Batch(reqs)
 	if err != nil {
 		return nil, err
 	}
 	if len(objs) != len(reqs) {
 		return nil, fmt.Errorf("cat-file returned %d of %d objects", len(objs), len(reqs))
 	}
-	evs := make([]model.Event, 0, len(shas))
+	tail := make([]tailEvent, 0, len(shas))
 	for i, sha := range shas {
 		if !objs[i].Present {
 			continue
@@ -452,9 +515,9 @@ func (s Source) tailEvents(shas []string) ([]model.Event, error) {
 			continue
 		}
 		ev.ID = sha[:10]
-		evs = append(evs, ev)
+		tail = append(tail, tailEvent{Event: ev, BlobSha: objs[i].OID})
 	}
-	return evs, nil
+	return tail, nil
 }
 
 // Write force-updates the cache ref to a fresh blob of p. Force is the
