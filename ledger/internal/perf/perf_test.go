@@ -65,10 +65,21 @@ func boardRender() [][]string {
 	return calls
 }
 
+// Default sizes are roughly geometric - 12.5k, 50k, 200k, 1M - so curvature
+// reads at a glance: if cost is linear in chain length, each step of 4x should
+// multiply the cold numbers by about 4, and a step that does not is the
+// finding. Two points can only ever draw a straight line.
+//
+// 12,500 is deliberately the floor rather than 50,000. It brackets the real
+// dgd ledger, which was 17,177 events on 2026-09-22, so at least one row of
+// every run describes the store we actually have instead of extrapolating
+// backwards into it. It also anchors the fixed cost: at 12.5k a warm read is
+// almost entirely process start and store open, which is what separates "this
+// verb is slow" from "there are fourteen of them".
 func sizes(t *testing.T) []int {
 	raw := os.Getenv("CHIT_PERF_SIZES")
 	if raw == "" {
-		raw = "50000,200000,1000000"
+		raw = "12500,50000,200000,1000000"
 	}
 	var out []int
 	for _, f := range strings.Split(raw, ",") {

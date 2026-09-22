@@ -34,7 +34,19 @@ From PowerShell, same thing with `${PWD}` and the paths quoted.
 |---|---|
 | `CHIT_PERF` | required; unset means every test here skips |
 | `CHIT_PERF_BIN` | required; path to a built chit binary |
-| `CHIT_PERF_SIZES` | comma-separated chain lengths. Default `50000,200000,1000000` |
+| `CHIT_PERF_SIZES` | comma-separated chain lengths. Default `12500,50000,200000,1000000` |
+
+The defaults are roughly geometric, 4x a step, so curvature reads at a glance:
+if cost is linear in chain length then each step should multiply the cold
+numbers by about four, and a step that does not is the finding. Two points can
+only ever draw a straight line.
+
+`12500` is the floor on purpose. It brackets the real dgd ledger - 17,177
+events on 2026-09-22 - so at least one row of every run describes the store we
+actually have rather than extrapolating backwards into it. It also anchors the
+fixed cost: at that size a warm read is almost entirely process start and store
+open, which is what separates "this verb is slow" from "there are fourteen of
+them".
 
 A quick pass while iterating:
 
