@@ -227,6 +227,24 @@ func unionRecs(sets ...[]cache.EventRec) []cache.EventRec {
 	return out
 }
 
+// committersFromIndex rebuilds the by-event-id committer map the four
+// cached read paths need, off the index's own Committers intern table
+// (dgd-272) instead of a per-call `git log` on the store. The name rides in
+// the blob already - idx.Events[i].CI is that event's slot in
+// idx.Committers - so this is a pure in-memory pass over data already read.
+// The *Folded twins (and cmd/render.go) still read committer names the old
+// way, off the store directly; only the index-backed paths have a
+// Committers table to build this off of.
+func committersFromIndex(idx cache.Index) map[string]string {
+	m := make(map[string]string, len(idx.Events))
+	for _, er := range idx.Events {
+		if er.CI >= 0 && er.CI < len(idx.Committers) {
+			m[er.ID] = idx.Committers[er.CI]
+		}
+	}
+	return m
+}
+
 // batchEventBodies fetches the full event.json body for each rec in ONE
 // batch call and decodes it back into a model.Event, restamping ID the way
 // eventsDAG/tailEvents do — an event's own JSON never carries its id (it's
@@ -671,7 +689,7 @@ func runStatusKeyCached(c *Ctx, p cache.Projection, idx cache.Index, key, field 
 		return out.Errf("git_failed", "", 1, "%s", err)
 	}
 
-	committers, _ := c.Store.Committers(p.Slug)
+	committers := committersFromIndex(idx)
 	notes := []noteDoc{}
 	var noteEvs []model.Event
 	for _, er := range noteRecs {
@@ -855,7 +873,7 @@ func runShowCached(c *Ctx, p cache.Projection, idx cache.Index, whereRaw []strin
 		}
 		rows = kept
 	}
-	committers, _ := c.Store.Committers(p.Slug)
+	committers := committersFromIndex(idx)
 
 	var noteRecs []cache.EventRec
 	for _, er := range idx.Events {
@@ -1072,7 +1090,7 @@ func runShowIDCached(c *Ctx, p cache.Projection, idx cache.Index, id string) err
 	if !ok {
 		return out.Errf("git_failed", "", 1, "event %s: body not found", rec.ID)
 	}
-	committers, _ := c.Store.Committers(p.Slug)
+	committers := committersFromIndex(idx)
 	payload := eventJSON(ev)
 	payload["ledger"] = p.Slug
 	payload["via"] = committers[ev.ID]
@@ -1298,7 +1316,7 @@ func runNotesCached(c *Ctx, p cache.Projection, idx cache.Index, kind, key, id s
 		}
 	}
 
-	committers, _ := c.Store.Committers(p.Slug)
+	committers := committersFromIndex(idx)
 	docs := make([]noteDoc, 0, len(matched))
 	for _, note := range matched {
 		docs = append(docs, noteDocOf(note, committers))

@@ -21,8 +21,18 @@ import (
 // render) and a second status write on a fresh key (so --where and the
 // per-key drill-down have something beyond Churn's own seeded keys) to an
 // already-seeded fixture.
+//
+// dgd-272: every scaletest.Seed/SeedMerged commit carries a hardcoded
+// "terminal" committer (scaletest.go's importer), so cacheFixtures alone
+// never exercises more than one distinct committer name - the case
+// dgd-272's interning (EventRec.CI into Committers) actually has to get
+// right. mustRun's writes go through the real store, whose committer is
+// model.HarnessMarker() - pinning CLAUDECODE here forces that to
+// "claude-code", deterministically distinct from scaletest's "terminal"
+// regardless of the ambient environment this test happens to run in.
 func enrichFixture(t *testing.T, f cacheFixture) {
 	t.Helper()
+	t.Setenv("CLAUDECODE", "1")
 	mustRun(t, f.dir, "set", "cache-test-key", "status=open", "--expect", "none",
 		"--ledger", f.slug, "-m", "seeded for dgd-265", "--as", "alice")
 	mustRun(t, f.dir, "note", "--kind", "handoff", "--key", "cache-test-key",

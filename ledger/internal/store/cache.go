@@ -2,6 +2,8 @@ package store
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 
 	"ledger/internal/cache"
 	"ledger/internal/gitx"
@@ -59,7 +61,8 @@ func (s Store) CacheSource(slug string) cache.Source {
 func (s Store) CacheIndexSource(slug string) cache.IndexSource {
 	return cache.IndexSource{
 		Git: s, Slug: slug, LedgerRef: ref(slug), IndexRef: cacheIndexRef(slug),
-		FoldIndex: func(rev string) (cache.Index, error) { return s.foldIndex(slug, rev) },
+		FoldIndex:      func(rev string) (cache.Index, error) { return s.foldIndex(slug, rev) },
+		TailCommitters: s.tailCommitters,
 	}
 }
 
@@ -82,7 +85,11 @@ func (s Store) foldProjection(slug, rev string) (cache.Projection, error) {
 // foldIndex is the index's from-root fold: eventsDAGWithSha's blob-sha map
 // rides along on the exact same batch read foldProjection's eventsDAG
 // already pays for on this same rev, so a total cache miss costs one
-// whole-chain read, not two.
+// whole-chain read, not two. The committer name per event comes off one
+// Store.Committers `git log` pass over the whole ref, unchanged from what
+// every *Folded read path still pays - dgd-272 only moves this cost out of
+// the CACHED paths, not out of a from-root fold, which already pays for the
+// whole chain regardless.
 func (s Store) foldIndex(slug, rev string) (cache.Index, error) {
 	evs, meta, _, blobSha, err := s.eventsDAGWithSha(rev, slug)
 	if err != nil {
@@ -92,7 +99,31 @@ func (s Store) foldIndex(slug, rev string) (cache.Index, error) {
 	if !ok {
 		return cache.Index{}, fmt.Errorf("%w: %s", ErrUnknownLedger, slug)
 	}
-	return cache.BuildIndex(slug, head, evs, meta, func(id string) string { return blobSha[id] }), nil
+	committers, _ := s.Committers(slug)
+	return cache.BuildIndex(slug, head, evs, meta,
+		func(id string) string { return blobSha[id] },
+		func(id string) string { return committers[id] }), nil
+}
+
+// tailCommitters is IndexSource.TailCommitters' backing: the same
+// mailmap-resolved `git log --format=%H %cn` path Store.Committers uses,
+// bounded to n commits back from head instead of the whole ref, so a tail
+// refresh's committer lookup stays as cheap as the walk it rides alongside
+// (WalkBound, never the whole chain).
+func (s Store) tailCommitters(head string, n int) (map[string]string, error) {
+	out, _, code := s.Repo.Git("", "log", `--format=%H %cn`, "-n", strconv.Itoa(n), head)
+	if code != 0 {
+		return nil, fmt.Errorf("git_failed: log -n %d %s", n, head)
+	}
+	m := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		sha, cn, ok := strings.Cut(line, " ")
+		if !ok {
+			continue
+		}
+		m[sha[:10]] = cn
+	}
+	return m, nil
 }
 
 // Projection answers a `ready`-shaped read through the fold cache, falling

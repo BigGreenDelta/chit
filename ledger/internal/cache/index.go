@@ -40,7 +40,12 @@ import (
 // projection blob's Version: the two evolve separately and either can
 // change without invalidating the other. A blob carrying anything else is
 // treated exactly like an absent ref.
-const IndexVersion = 1
+//
+// v2 (dgd-272) adds Committers/EventRec.CI: the committer name dgd-272 moved
+// off Store.Committers' per-call `git log` and into the blob itself, so a
+// v1 blob (no Committers, no CI slots) is unreadable under v2 and degrades
+// like any other version mismatch - never misread as an all-zero CI.
+const IndexVersion = 2
 
 // SpineEntry is one (key, field) cell: the latest SET event's value, plus
 // everything rowOf renders alongside it. Key and field are not repeated
@@ -57,7 +62,11 @@ type SpineEntry struct {
 
 // EventRec is one non-sync event's lightweight record: enough to select on
 // (kind, key, an id prefix) and enough to fetch the body if selected
-// (BlobSha), never the body itself.
+// (BlobSha), never the body itself. CI is this event's committer's slot in
+// the blob's Committers list (dgd-272) - interned rather than a name per
+// record, so a chain with few distinct committers stays near flat as the
+// event count grows instead of repeating the same string thousands of
+// times.
 type EventRec struct {
 	ID      string `json:"id"`
 	BlobSha string `json:"blob_sha"`
@@ -66,31 +75,40 @@ type EventRec struct {
 	Key     string `json:"key,omitempty"`
 	TS      string `json:"ts"`
 	Author  string `json:"author"`
+	CI      int    `json:"ci"`
 }
 
 // IndexBlob is the index's on-disk schema. Field order here is the byte
 // order (see Blob's own comment - the same rule, the same reason): sorted
 // map keys plus a fixed struct field order gives exactly one encoding for
 // one value.
+//
+// Committers is the dgd-272 intern table, first-appearance order across
+// Events: EventRec.CI indexes into it. First-appearance order rather than
+// sorted is what keeps this deterministic without a second sort key -
+// Events is already in the one chronological order every fold produces, so
+// walking it once assigns each name the same slot every time.
 type IndexBlob struct {
-	V      int                              `json:"v"`
-	Slug   string                           `json:"slug"`
-	Base   string                           `json:"base"`
-	Schema map[string][]string              `json:"schema"`
-	Spine  map[string]map[string]SpineEntry `json:"spine"`
-	Events []EventRec                       `json:"events"`
+	V          int                              `json:"v"`
+	Slug       string                           `json:"slug"`
+	Base       string                           `json:"base"`
+	Schema     map[string][]string              `json:"schema"`
+	Spine      map[string]map[string]SpineEntry `json:"spine"`
+	Events     []EventRec                       `json:"events"`
+	Committers []string                         `json:"committers"`
 }
 
 // Index is IndexBlob plus the read-time bookkeeping (Origin) that makes it
 // interchangeable, by convention, with the from-root build the same way
 // Projection is.
 type Index struct {
-	Slug   string
-	Base   string
-	Schema map[string][]string
-	Spine  map[string]map[string]SpineEntry
-	Events []EventRec
-	Origin Origin
+	Slug       string
+	Base       string
+	Schema     map[string][]string
+	Spine      map[string]map[string]SpineEntry
+	Events     []EventRec
+	Committers []string
+	Origin     Origin
 }
 
 // cloneSchema copies meta.Fields the way fold.Fold's own schema init does:
@@ -112,8 +130,9 @@ func cloneSchema(fields map[string][]string) map[string][]string {
 // fold.Fold's own set/vocab rules, replayed onto an index's Schema and
 // Spine, plus the lightweight event record every non-sync event gets
 // regardless of type. blobSha names the event.json blob this event's
-// record points at, for a later body fetch.
-func applyIndexEvent(schema map[string][]string, spine map[string]map[string]SpineEntry, ev model.Event, blobSha string) EventRec {
+// record points at, for a later body fetch; ci is this event's already
+// -interned committer slot (see internCommitter).
+func applyIndexEvent(schema map[string][]string, spine map[string]map[string]SpineEntry, ev model.Event, blobSha string, ci int) EventRec {
 	switch ev.Type {
 	case "set":
 		for f, v := range ev.Fields {
@@ -130,31 +149,61 @@ func applyIndexEvent(schema map[string][]string, spine map[string]map[string]Spi
 			schema[ev.Field] = append(schema[ev.Field], ev.Value)
 		}
 	}
-	return EventRec{ID: ev.ID, BlobSha: blobSha, Type: ev.Type, Kind: ev.Kind, Key: ev.Key, TS: ev.TS, Author: ev.Author}
+	return EventRec{ID: ev.ID, BlobSha: blobSha, Type: ev.Type, Kind: ev.Kind, Key: ev.Key, TS: ev.TS, Author: ev.Author, CI: ci}
+}
+
+// internCommitter returns name's slot in *list, appending it in
+// first-appearance order the first time name is seen. Shared by BuildIndex's
+// from-root fold and ApplyTail's tail extension so both derive the identical
+// ordering rule the blob's byte-determinism depends on.
+func internCommitter(list *[]string, seen map[string]int, name string) int {
+	if ci, ok := seen[name]; ok {
+		return ci
+	}
+	ci := len(*list)
+	*list = append(*list, name)
+	seen[name] = ci
+	return ci
 }
 
 // BuildIndex folds evs (already sentinel-contracted, chronological - the
 // same slice fold.Fold and cache.Project consume) into an Index. blobSha
 // names the event.json blob sha for event id i - the caller already has it
 // off the same cat-file batch that decoded evs, at eventsDAG or at
-// scratch-fold time, so no second read is spent getting it.
-func BuildIndex(slug, head string, evs []model.Event, meta model.Meta, blobSha func(id string) string) Index {
+// scratch-fold time, so no second read is spent getting it. committer names
+// event id i's committer - dgd-272's replacement for a per-call
+// Store.Committers `git log`, interned into Committers as evs is walked.
+func BuildIndex(slug, head string, evs []model.Event, meta model.Meta, blobSha func(id string) string, committer func(id string) string) Index {
 	schema := cloneSchema(meta.Fields)
 	spine := map[string]map[string]SpineEntry{}
 	events := make([]EventRec, 0, len(evs))
+	committers := []string{}
+	seen := map[string]int{}
 	for _, ev := range evs {
-		events = append(events, applyIndexEvent(schema, spine, ev, blobSha(ev.ID)))
+		ci := internCommitter(&committers, seen, committer(ev.ID))
+		events = append(events, applyIndexEvent(schema, spine, ev, blobSha(ev.ID), ci))
 	}
-	return Index{Slug: slug, Base: head, Schema: schema, Spine: spine, Events: events, Origin: OriginRoot}
+	return Index{Slug: slug, Base: head, Schema: schema, Spine: spine, Events: events, Committers: committers, Origin: OriginRoot}
 }
 
 // ApplyTail extends ix in place with a bounded tail of new events, the
 // index's counterpart to board.Board.ApplyTail: same rule (fold.Fold's
 // set/vocab logic), same replay order, over the (event, blob sha) pairs the
-// walk already fetched.
-func (ix *Index) ApplyTail(tail []tailEvent) {
+// walk already fetched. committerOf keys the tail's committer names by
+// event id (IndexSource.TailCommitters' shape, matching Store.Committers'
+// own 10-char truncation), and new names are appended to ix.Committers in
+// the same first-appearance order BuildIndex would have produced folding
+// the whole chain in one pass - the cached prefix's names come first
+// because they were interned first, and the tail's new names follow in the
+// order the tail itself introduces them.
+func (ix *Index) ApplyTail(tail []tailEvent, committerOf map[string]string) {
+	seen := make(map[string]int, len(ix.Committers))
+	for i, name := range ix.Committers {
+		seen[name] = i
+	}
 	for _, te := range tail {
-		ix.Events = append(ix.Events, applyIndexEvent(ix.Schema, ix.Spine, te.Event, te.BlobSha))
+		ci := internCommitter(&ix.Committers, seen, committerOf[te.Event.ID])
+		ix.Events = append(ix.Events, applyIndexEvent(ix.Schema, ix.Spine, te.Event, te.BlobSha, ci))
 	}
 }
 
@@ -173,7 +222,11 @@ func EncodeIndex(ix Index) ([]byte, error) {
 	if events == nil {
 		events = []EventRec{}
 	}
-	return json.Marshal(IndexBlob{V: IndexVersion, Slug: ix.Slug, Base: ix.Base, Schema: schema, Spine: spine, Events: events})
+	committers := ix.Committers
+	if committers == nil {
+		committers = []string{}
+	}
+	return json.Marshal(IndexBlob{V: IndexVersion, Slug: ix.Slug, Base: ix.Base, Schema: schema, Spine: spine, Events: events, Committers: committers})
 }
 
 // decodeIndex turns blob bytes back into an Index. Origin is the caller's
@@ -189,19 +242,24 @@ func decodeIndex(raw []byte) (Index, error) {
 	if len(b.Base) != 40 && len(b.Base) != 64 {
 		return Index{}, fmt.Errorf("%w: base %q is not a full sha", ErrNoCache, b.Base)
 	}
-	return Index{Slug: b.Slug, Base: b.Base, Schema: b.Schema, Spine: b.Spine, Events: b.Events}, nil
+	return Index{Slug: b.Slug, Base: b.Base, Schema: b.Schema, Spine: b.Spine, Events: b.Events, Committers: b.Committers}, nil
 }
 
 // IndexSource binds one slug's index cache to a store - the same shape as
 // Source, over the second ref and the index schema instead of the
 // projection's. FoldIndex is this slug's from-root index build, the
-// fallback every validation failure degrades to.
+// fallback every validation failure degrades to. TailCommitters answers a
+// tail refresh's committer names - up to n commits back from head, the same
+// mailmap-resolved path Store.Committers uses for a whole-chain read, just
+// bounded - so a tail application never has to fall back to Store.Committers
+// itself.
 type IndexSource struct {
-	Git       Git
-	Slug      string
-	LedgerRef string
-	IndexRef  string
-	FoldIndex func(rev string) (Index, error)
+	Git            Git
+	Slug           string
+	LedgerRef      string
+	IndexRef       string
+	FoldIndex      func(rev string) (Index, error)
+	TailCommitters func(head string, n int) (map[string]string, error)
 }
 
 // LoadRaw reads the index ref's blob bytes, unvalidated.
@@ -248,7 +306,11 @@ func (s IndexSource) TryRead() (Index, bool) {
 	if err != nil {
 		return Index{}, false
 	}
-	ix.ApplyTail(tail)
+	committers, err := s.TailCommitters(head, WalkBound)
+	if err != nil {
+		return Index{}, false
+	}
+	ix.ApplyTail(tail, committers)
 	ix.Base = head
 	ix.Origin = OriginTail
 	return ix, true

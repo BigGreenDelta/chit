@@ -435,7 +435,7 @@ func TestIndexIgnoredWhenSchemaVersionDiffers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bumped := strings.Replace(string(raw), `{"v":1,`, `{"v":99,`, 1)
+	bumped := strings.Replace(string(raw), `{"v":2,`, `{"v":99,`, 1)
 	if bumped == string(raw) {
 		t.Fatalf("fixture: the version field is not where this test expects it: %s", raw[:40])
 	}
