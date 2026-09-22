@@ -746,8 +746,8 @@ func TestSyncNeverFetchesTheCacheNamespace(t *testing.T) {
 	}
 
 	// Write a cache ref DIRECTLY on the remote, bypassing chit push
-	// entirely — the only way one could plausibly get there (a hand
-	// push, an old client, a compromised mirror) — then confirm a clone
+	// entirely - the only way one could plausibly get there (a hand
+	// push, an old client, a compromised mirror) - then confirm a clone
 	// and a sync both leave it behind.
 	if _, ok := res.Store.RevParse(store.CacheRef("board")); !ok {
 		t.Fatal("fixture: no local cache blob to plant on the remote")
@@ -758,12 +758,11 @@ func TestSyncNeverFetchesTheCacheNamespace(t *testing.T) {
 	// directly, which is the only way this ref could plausibly reach the
 	// remote at all now that chit itself never names it.
 	git(t, a, "push", "origin", store.CacheRef("board")+":"+store.CacheRef("board"))
+	git(t, a, "push", "origin", store.CacheIndexRef("board")+":"+store.CacheIndexRef("board"))
 
 	b := root + "/b"
 	git(t, "", "clone", "-q", remoteDir, b)
-	if listed := git(t, b, "for-each-ref", "--format=%(refname)", "refs/ledger-cache/"); strings.TrimSpace(listed) != "" {
-		t.Fatalf("git clone brought in the cache namespace: %q", listed)
-	}
+	assertNoCacheRefsAnywhere(t, b, "git clone")
 
 	c := root + "/c"
 	git(t, "", "clone", "-q", remoteDir, c)
@@ -772,8 +771,23 @@ func TestSyncNeverFetchesTheCacheNamespace(t *testing.T) {
 	if _, se, code := run(t, c, "sync", "--remote", "origin"); code != 0 {
 		t.Fatalf("sync: %d %s", code, se)
 	}
-	if listed := git(t, c, "for-each-ref", "--format=%(refname)", "refs/ledger-cache/"); strings.TrimSpace(listed) != "" {
-		t.Fatalf("chit sync fetched the cache namespace: %q", listed)
+	assertNoCacheRefsAnywhere(t, c, "chit sync")
+}
+
+// assertNoCacheRefsAnywhere lists every ref in dir, under every namespace,
+// and fails if any refname mentions the cache. A prefix-scoped check (only
+// refs/ledger-cache/) would pass even if a widened fetch refspec landed the
+// same ref under refs/ledger-remote/<remote>/* or refs/remotes/origin/* -
+// those are exactly where git actually writes fetched refs, so the
+// assertion has to cover the whole ref namespace, not just the one name
+// chit itself would use.
+func assertNoCacheRefsAnywhere(t *testing.T, dir, action string) {
+	t.Helper()
+	listed := git(t, dir, "for-each-ref", "--format=%(refname)")
+	for _, line := range strings.Split(listed, "\n") {
+		if strings.Contains(line, "ledger-cache") {
+			t.Fatalf("%s brought in a cache ref: %q", action, strings.TrimSpace(listed))
+		}
 	}
 }
 
