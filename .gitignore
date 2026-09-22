@@ -6,3 +6,6 @@ dist/
 # locally built binaries
 ledger/chit
 ledger/chit-gh
+
+# perf probe output (internal/perf/README.md)
+.perf/
