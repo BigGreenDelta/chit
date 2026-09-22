@@ -667,12 +667,13 @@ func TestCacheResetRebuildsFromRoot(t *testing.T) {
 	}
 }
 
-// TestPushReplicatesTheCacheRef is criterion 6, and it counts refs on the
-// REMOTE rather than trusting an exit code. refs/ledger-cache/* sits
-// outside refs/heads/*, exactly like refs/ledger/* does, so a push can
-// transfer zero refs and still exit 0 - which is how this would have
-// shipped broken.
-func TestPushReplicatesTheCacheRef(t *testing.T) {
+// TestPushNeverReplicatesTheCacheRef is criterion 6, reversed by dgd-268:
+// the cache is local only, so `chit push` must never transfer
+// refs/ledger-cache/<slug> (or its index), even though the ref exists
+// locally and even across a second push after the cache moved. It counts
+// refs on the REMOTE rather than trusting an exit code, since a push that
+// silently drops a ref still exits 0.
+func TestPushNeverReplicatesTheCacheRef(t *testing.T) {
 	root := t.TempDir()
 	remoteDir := root + "/remote.git"
 	git(t, "", "init", "--bare", "-q", remoteDir)
@@ -689,51 +690,90 @@ func TestPushReplicatesTheCacheRef(t *testing.T) {
 	if _, err := s.CacheSource("board").Reset(); err != nil {
 		t.Fatal(err)
 	}
-	localBlob, ok := s.RevParse(store.CacheRef("board"))
-	if !ok {
-		t.Fatal("no local cache ref to push")
+	if _, ok := s.RevParse(store.CacheRef("board")); !ok {
+		t.Fatal("fixture: no local cache ref, so this proves nothing")
 	}
 
 	if _, se, code := run(t, a, "push", "--remote", "origin"); code != 0 {
 		t.Fatalf("push: %d %s", code, se)
 	}
 
-	// Count refs on the remote. Not the exit code.
-	listed := git(t, remoteDir, "for-each-ref", "--format=%(refname)", "refs/ledger-cache/")
-	n := 0
-	for _, l := range strings.Split(listed, "\n") {
-		if strings.TrimSpace(l) != "" {
-			n++
-		}
-	}
-	if n < 1 {
-		t.Fatalf("push transferred ZERO cache refs and still exited 0 - "+
-			"the +refs/ledger-cache/<slug> refspec is missing or lost its '+'; remote refs: %q", listed)
-	}
-	if got := git(t, remoteDir, "rev-parse", store.CacheRef("board")); got != localBlob {
-		t.Fatalf("remote cache ref is %s, local is %s", got, localBlob)
-	}
-	if typ := git(t, remoteDir, "cat-file", "-t", localBlob); typ != "blob" {
-		t.Fatalf("the cache object did not transfer as a blob: %q", typ)
-	}
+	assertNoCacheRefsOnRemote(t, remoteDir)
 
-	// The force carve-out: a SECOND push after the cache moved must still
-	// replicate, and that is the whole reason the refspec carries a '+'.
-	// Without it git rejects the non-fast-forward and replication stops
-	// silently while push keeps exiting 0.
+	// A second push, after the local cache moved, must still send nothing.
 	mustRun(t, a, "set", "k-2", "status=open", "--expect", "none", "--ledger", "board", "-m", "two", "--as", "alice")
 	if _, err := s.CacheSource("board").Reset(); err != nil {
 		t.Fatal(err)
 	}
-	moved, _ := s.RevParse(store.CacheRef("board"))
-	if moved == localBlob {
-		t.Fatal("fixture: the cache blob did not move, so this proves nothing")
-	}
 	if _, se, code := run(t, a, "push", "--remote", "origin"); code != 0 {
 		t.Fatalf("second push: %d %s", code, se)
 	}
-	if got := git(t, remoteDir, "rev-parse", store.CacheRef("board")); got != moved {
-		t.Fatalf("a force-updated cache ref did not replicate on the second push: remote %s, local %s", got, moved)
+	assertNoCacheRefsOnRemote(t, remoteDir)
+}
+
+func assertNoCacheRefsOnRemote(t *testing.T, remoteDir string) {
+	t.Helper()
+	for _, prefix := range []string{"refs/ledger-cache/", "refs/ledger-cache-index/"} {
+		listed := git(t, remoteDir, "for-each-ref", "--format=%(refname)", prefix)
+		if strings.TrimSpace(listed) != "" {
+			t.Fatalf("push transferred a ref under %s, which must be local only: %q", prefix, listed)
+		}
+	}
+}
+
+// TestSyncNeverFetchesTheCacheNamespace and TestPushNeverReplicatesTheCacheRef
+// together pin the dgd-268 trust boundary: the cache namespace
+// (refs/ledger-cache/* and refs/ledger-cache-index/*) is asserted to be
+// local only, not just true today by refspec. A hostile cache ref now
+// requires local write access to the store, since neither push nor sync
+// ever moves the namespace across a remote.
+func TestSyncNeverFetchesTheCacheNamespace(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := root + "/remote.git"
+	git(t, "", "init", "--bare", "-q", remoteDir)
+	a := root + "/a"
+	git(t, "", "clone", "-q", remoteDir, a)
+	git(t, a, "config", "user.name", "t")
+	git(t, a, "config", "user.email", "t@t")
+	git(t, a, "commit", "-q", "--allow-empty", "-m", "init")
+	seedBoard(t, a, "board")
+	res, _ := store.Resolve(a)
+	if _, err := res.Store.CacheSource("board").Reset(); err != nil {
+		t.Fatal(err)
+	}
+	if _, se, code := run(t, a, "push", "--remote", "origin"); code != 0 {
+		t.Fatalf("push: %d %s", code, se)
+	}
+
+	// Write a cache ref DIRECTLY on the remote, bypassing chit push
+	// entirely — the only way one could plausibly get there (a hand
+	// push, an old client, a compromised mirror) — then confirm a clone
+	// and a sync both leave it behind.
+	if _, ok := res.Store.RevParse(store.CacheRef("board")); !ok {
+		t.Fatal("fixture: no local cache blob to plant on the remote")
+	}
+	// A raw `git push` with an explicit refspec, never through `chit push`,
+	// is what stands in for "a hand push, an old client, a compromised
+	// mirror" here: it transfers the blob object and plants the ref
+	// directly, which is the only way this ref could plausibly reach the
+	// remote at all now that chit itself never names it.
+	git(t, a, "push", "origin", store.CacheRef("board")+":"+store.CacheRef("board"))
+
+	b := root + "/b"
+	git(t, "", "clone", "-q", remoteDir, b)
+	if listed := git(t, b, "for-each-ref", "--format=%(refname)", "refs/ledger-cache/"); strings.TrimSpace(listed) != "" {
+		t.Fatalf("git clone brought in the cache namespace: %q", listed)
+	}
+
+	c := root + "/c"
+	git(t, "", "clone", "-q", remoteDir, c)
+	git(t, c, "config", "user.name", "t")
+	git(t, c, "config", "user.email", "t@t")
+	if _, se, code := run(t, c, "sync", "--remote", "origin"); code != 0 {
+		t.Fatalf("sync: %d %s", code, se)
+	}
+	if listed := git(t, c, "for-each-ref", "--format=%(refname)", "refs/ledger-cache/"); strings.TrimSpace(listed) != "" {
+		t.Fatalf("chit sync fetched the cache namespace: %q", listed)
 	}
 }
 

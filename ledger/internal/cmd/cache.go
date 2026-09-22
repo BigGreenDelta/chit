@@ -18,10 +18,14 @@ func newCacheCmd(c *Ctx) *cobra.Command {
 		Long: "The fold cache is a derived blob at refs/ledger-cache/<slug>, force-updated,\n" +
 			"holding the folded board projection plus the ledger sha it was folded from.\n" +
 			"`ready` and `watch` read through it; every other verb still folds the chain.\n" +
+			"It is local only: chit never pushes or fetches this ref.\n" +
 			"\n" +
-			"It is never authoritative: a reader that cannot prove the blob describes its own\n" +
-			"history ignores it and folds from root. Nothing here can make a read WRONG  - \n" +
-			"only slower. These verbs exist to rebuild it and to prove that property holds."}
+			"It is never authoritative: a reader that cannot prove the blob's base attaches\n" +
+			"to the local chain ignores it and folds from root. That proves linkage, not\n" +
+			"content - a blob whose base is the real head but whose contents are forged\n" +
+			"passes every check and is read as-is. Forging one now requires local write\n" +
+			"access to the store's refs, since the cache is never pushed. These verbs\n" +
+			"exist to rebuild it and to prove the linkage property holds."}
 	reset := &cobra.Command{Use: "reset <slug>", Short: "drop the cache ref and rebuild it from root",
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error { return runCacheReset(c, args[0]) }}
@@ -104,7 +108,7 @@ func runCacheVerify(c *Ctx, slug string) error {
 		// now returns that as a cache_unreadable difference instead (exit
 		// 5): the read path is right to ignore such a ref, but ignoring it
 		// is precisely the thing an operator asked this verb to tell them
-		// about. See cache.ErrUnreadableCache for why the two part here.
+		// about. See cache.UnreadableCacheError for why the two part here.
 		outEmit(c, map[string]any{"ledger": slug, "ref": store.CacheRef(slug),
 			"index_ref": store.CacheIndexRef(slug), "cache": nil, "differences": []any{}},
 			[]string{slug + "  no cache ref - nothing to verify (chit cache reset " + slug + " builds one)"})

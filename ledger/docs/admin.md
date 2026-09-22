@@ -45,18 +45,25 @@ Three facts an admin needs:
   all (a commit sha, say). Absence is the only clean non-cache: a store
   that has never written one must not look corrupt, or the check could not
   be run unconditionally.
-- It is **force-updated**, and `chit push` force-pushes it - the one
-  exception to chit's otherwise non-force push. A remote with
-  `receive.denyNonFastForwards` set will therefore reject the cache ref on
-  every push after the first. That is harmless: replication of the cache
-  stops, reads on the far side fold from root, and nothing is lost or
-  wrong. Scope the setting to `refs/ledger/*` if you want both.
-- It is **never trusted blind**. A reader that cannot prove the blob
-  describes its own history - because the base sha is foreign, ahead of the
-  local tip, or separated from it by a merge - ignores the blob entirely and
-  folds from root. That is what makes a pushed cache safe between replicas
-  with no handshake, and it means a stale or hostile cache ref can make a
-  read slower but never wrong.
+- It is **force-updated** on every refresh, but `chit push` never pushes it
+  (nor `refs/ledger-cache-index/*`). The cache is local only: a fresh clone
+  or `chit sync` never fetches either namespace, so there is nothing to
+  scope `receive.denyNonFastForwards` around here.
+- It is **never trusted blind, but only against linkage, not content**. A
+  reader that cannot prove the blob's base attaches to the local chain -
+  because the base sha is foreign, ahead of the local tip, or separated
+  from it by a merge, among other shapes - ignores the blob entirely and
+  folds from root. That bounded walk on `base..head` proves the blob's
+  base sha is reachable from head; it proves nothing about whether the
+  blob's `keys` actually reflect that history. A blob whose `base` is the
+  real head but whose contents are forged passes every validation and is
+  read as-is. Corruption shapes that do degrade safely this way: absent,
+  undecodable, bad schema version, foreign base, base-ahead-of-head,
+  merge-in-range, tail-past-bound, and a ref pointing at something that is
+  not a cache blob at all. Forging the blob itself is not one of them, and
+  now requires local write access to the store's refs - the cache is
+  never pushed, so that access means owning the machine, not merely
+  having push rights to a shared remote.
 
 ## `receive.denyDeletes`: the tradeoff
 
