@@ -34,19 +34,28 @@ From PowerShell, same thing with `${PWD}` and the paths quoted.
 |---|---|
 | `CHIT_PERF` | required; unset means every test here skips |
 | `CHIT_PERF_BIN` | required; path to a built chit binary |
-| `CHIT_PERF_SIZES` | comma-separated chain lengths. Default `12500,50000,200000,1000000` |
+| `CHIT_PERF_SIZES` | comma-separated chain lengths. Default `12500,25000,50000,200000,1000000` |
 
-The defaults are roughly geometric, 4x a step, so curvature reads at a glance:
-if cost is linear in chain length then each step should multiply the cold
-numbers by about four, and a step that does not is the finding. Two points can
-only ever draw a straight line.
+The defaults are geometric, so curvature reads at a glance: if cost is linear
+in chain length then doubling the events should double the cold numbers, and a
+step that does not is the finding. Two points can only ever draw a straight
+line.
 
-`12500` is the floor on purpose. It brackets the real dgd ledger - 17,177
-events on 2026-09-22 - so at least one row of every run describes the store we
-actually have rather than extrapolating backwards into it. It also anchors the
-fixed cost: at that size a warm read is almost entirely process start and store
-open, which is what separates "this verb is slow" from "there are fourteen of
-them".
+The low end is dense on purpose. Three 2x steps in a row - 12.5k, 25k, 50k - is
+what separates the **intercept** from the **slope**: fixed cost per invocation,
+which is process start plus store open, against cost that grows with the chain.
+Spread the points out and the two become indistinguishable, which is how "chit
+is slow" gets believed when the truth is "there are fourteen of them".
+
+**12,500 is not a real test.** A chain that size is nothing, so whatever a verb
+costs there is very nearly all fixed cost. It is the zero mark on the ruler,
+not a workload anyone cares about, and every other row is read against it. The
+interesting rows are 200k and 1M.
+
+It does sit just under the real dgd ledger - 17,177 events on 2026-09-22 - and
+that is worth one sentence: today's store is still in the region where chain
+length barely matters, so anything that feels slow now is fixed cost, not
+history.
 
 A quick pass while iterating:
 
