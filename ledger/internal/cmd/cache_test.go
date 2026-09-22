@@ -749,8 +749,13 @@ func TestSyncNeverFetchesTheCacheNamespace(t *testing.T) {
 	// entirely - the only way one could plausibly get there (a hand
 	// push, an old client, a compromised mirror) - then confirm a clone
 	// and a sync both leave it behind.
-	if _, ok := res.Store.RevParse(store.CacheRef("board")); !ok {
+	cacheOID, ok := res.Store.RevParse(store.CacheRef("board"))
+	if !ok {
 		t.Fatal("fixture: no local cache blob to plant on the remote")
+	}
+	indexOID, ok := res.Store.RevParse(store.CacheIndexRef("board"))
+	if !ok {
+		t.Fatal("fixture: no local cache-index blob to plant on the remote")
 	}
 	// A raw `git push` with an explicit refspec, never through `chit push`,
 	// is what stands in for "a hand push, an old client, a compromised
@@ -760,9 +765,14 @@ func TestSyncNeverFetchesTheCacheNamespace(t *testing.T) {
 	git(t, a, "push", "origin", store.CacheRef("board")+":"+store.CacheRef("board"))
 	git(t, a, "push", "origin", store.CacheIndexRef("board")+":"+store.CacheIndexRef("board"))
 
+	// Confirm the plant actually landed before trusting anything downstream
+	// of it: if the plant ever silently failed, the clone and sync checks
+	// below would pass vacuously on a remote that never carried the ref.
+	assertRemoteHasCacheRefs(t, remoteDir, cacheOID, indexOID)
+
 	b := root + "/b"
 	git(t, "", "clone", "-q", remoteDir, b)
-	assertNoCacheRefsAnywhere(t, b, "git clone")
+	assertNoCacheRefsAnywhere(t, b, "git clone", cacheOID, indexOID)
 
 	c := root + "/c"
 	git(t, "", "clone", "-q", remoteDir, c)
@@ -771,22 +781,38 @@ func TestSyncNeverFetchesTheCacheNamespace(t *testing.T) {
 	if _, se, code := run(t, c, "sync", "--remote", "origin"); code != 0 {
 		t.Fatalf("sync: %d %s", code, se)
 	}
-	assertNoCacheRefsAnywhere(t, c, "chit sync")
+	assertNoCacheRefsAnywhere(t, c, "chit sync", cacheOID, indexOID)
 }
 
-// assertNoCacheRefsAnywhere lists every ref in dir, under every namespace,
-// and fails if any refname mentions the cache. A prefix-scoped check (only
-// refs/ledger-cache/) would pass even if a widened fetch refspec landed the
-// same ref under refs/ledger-remote/<remote>/* or refs/remotes/origin/* -
-// those are exactly where git actually writes fetched refs, so the
-// assertion has to cover the whole ref namespace, not just the one name
-// chit itself would use.
-func assertNoCacheRefsAnywhere(t *testing.T, dir, action string) {
+// assertRemoteHasCacheRefs confirms the hand-planted cache refs actually
+// landed on the bare remote before the clone/sync assertions below trust
+// their absence downstream to mean anything.
+func assertRemoteHasCacheRefs(t *testing.T, remoteDir, cacheOID, indexOID string) {
 	t.Helper()
-	listed := git(t, dir, "for-each-ref", "--format=%(refname)")
+	listed := git(t, remoteDir, "for-each-ref", "--format=%(objectname) %(refname)")
+	for _, oid := range []string{cacheOID, indexOID} {
+		if !strings.Contains(listed, oid) {
+			t.Fatalf("fixture: planted cache ref for %s never landed on remote: %q", oid, listed)
+		}
+	}
+}
+
+// assertNoCacheRefsAnywhere lists every ref and its object in dir, under
+// every namespace, and fails if any ref resolves to one of the planted
+// cache object IDs. Checking by NAME (refs/ledger-cache/*) would pass even
+// if a widened fetch refspec landed the same object under
+// refs/ledger-remote/<remote>/* or refs/remotes/origin/* - git rewrites the
+// refname on fetch, so "ledger-cache" need not survive in it even though
+// the cache blob itself did. Checking by object identity catches that
+// regardless of what name the ref ends up under.
+func assertNoCacheRefsAnywhere(t *testing.T, dir, action, cacheOID, indexOID string) {
+	t.Helper()
+	listed := git(t, dir, "for-each-ref", "--format=%(objectname) %(refname)")
 	for _, line := range strings.Split(listed, "\n") {
-		if strings.Contains(line, "ledger-cache") {
-			t.Fatalf("%s brought in a cache ref: %q", action, strings.TrimSpace(listed))
+		for _, oid := range []string{cacheOID, indexOID} {
+			if oid != "" && strings.HasPrefix(line, oid) {
+				t.Fatalf("%s brought in a cache object under a ref: %q", action, strings.TrimSpace(line))
+			}
 		}
 	}
 }
