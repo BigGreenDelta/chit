@@ -76,13 +76,17 @@ func init() { register(newImportCmd) }
 
 func newImportCmd(c *Ctx) *cobra.Command {
 	var slug string
+	var multiFields, guard, release []string
 	cmd := &cobra.Command{Use: "import <path>", Short: "recreate a ledger from an export file",
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			return runImport(c, args[0], slug)
+			return runImport(c, args[0], slug, multiFields, guard, release)
 		}}
 	cmd.Flags().StringVar(&slug, "slug", "", "slug for the new ledger (must not already exist)")
 	cmd.MarkFlagRequired("slug")
+	cmd.Flags().StringArrayVar(&multiFields, "multi-field", nil, "NAME: add a multi-valued field to the imported declaration (refused if the export already declares it); repeatable")
+	cmd.Flags().StringArrayVar(&guard, "guard", nil, "FIELD: add a guard to the imported declaration (refused if already guarded); repeatable")
+	cmd.Flags().StringArrayVar(&release, "release", nil, "status=V1,V2 and/or labels=L1,L2: add a blocked-by release rule (refused if the export already has one); repeatable")
 	return cmd
 }
 
@@ -105,7 +109,7 @@ func newImportCmd(c *Ctx) *cobra.Command {
 // would then be permanently unusable. Once the whole file checks out, the
 // entire chain lands under one CAS ref creation via AppendChain — either the
 // full import lands or none of it does.
-func runImport(c *Ctx, path, newSlug string) error {
+func runImport(c *Ctx, path, newSlug string, addMulti, addGuard, addRelease []string) error {
 	if !model.ValidSlug(newSlug) {
 		return out.Errf("bad_slug", "slugs are lowercase-kebab: [a-z0-9][a-z0-9-]*, max 64 chars", 4,
 			"'%s' is not a valid slug", newSlug)
@@ -153,6 +157,30 @@ func runImport(c *Ctx, path, newSlug string) error {
 
 	meta := header.Meta
 	meta.Slug = newSlug
+	// The add flags only ever ADD to the declaration; never the status
+	// vocab, the terminal set, or an existing rule (those stay immutable).
+	for _, f := range addMulti {
+		if model.Contains(meta.MultiFields, f) {
+			return out.Errf("bad_value", "drop --multi-field "+f, 4, "the export already declares multi-field '%s'", f)
+		}
+		meta.MultiFields = append(meta.MultiFields, f)
+	}
+	for _, f := range addGuard {
+		if model.Contains(meta.Guard, f) {
+			return out.Errf("bad_value", "drop --guard "+f, 4, "the export already guards '%s'", f)
+		}
+		meta.Guard = append(meta.Guard, f)
+	}
+	if len(addRelease) > 0 {
+		if meta.Release != nil {
+			return out.Errf("bad_value", "drop --release: a declared rule is never changed", 4, "the export already declares a release rule")
+		}
+		rule, err := model.ParseReleaseSpecs(addRelease)
+		if err != nil {
+			return out.Errf("bad_value", "e.g. --release status=closed --release labels=merged", 4, "%s", err)
+		}
+		meta.Release = rule
+	}
 	if declErr := model.ValidateDeclarations(meta); declErr != nil {
 		return out.Errf(declErr.Ident, declErr.Hint, 4, "%s", declErr.Msg)
 	}

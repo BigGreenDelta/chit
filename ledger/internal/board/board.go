@@ -242,6 +242,31 @@ func (b *Board) IsTerminal(value string) bool {
 	return false
 }
 
+// Releases reports whether blocker releases a blocked-by edge: with no
+// declared release rule, any terminal status does (labels ignored); with
+// one, the blocker's status must be in the rule's status set AND its
+// labels must contain every rule label. A blocker with no status never
+// releases. Not sticky: it reads the blocker's latest state each time.
+func (b *Board) Releases(blocker *Key) bool {
+	if blocker == nil || blocker.Status == nil {
+		return false
+	}
+	r := b.Meta.Release
+	if r == nil {
+		return b.IsTerminal(blocker.Status.Value)
+	}
+	if !model.Contains(r.Status, blocker.Status.Value) {
+		return false
+	}
+	labels := blocker.Labels()
+	for _, want := range r.Labels {
+		if !model.Contains(labels, want) {
+			return false
+		}
+	}
+	return true
+}
+
 // HasHuman reports whether the key carries the reserved "human" label
 // token, among however many other tokens it has.
 func (k *Key) HasHuman() bool {

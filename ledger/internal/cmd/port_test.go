@@ -359,3 +359,131 @@ func TestImportedCommitterMarker(t *testing.T) {
 		t.Fatalf("import provenance: %q (must render as (imported), never the importing harness)", out)
 	}
 }
+
+// ledgerMeta reads a ledger's meta.json, which only the chain's root commit
+// carries.
+func ledgerMeta(t *testing.T, dir, slug string) string {
+	t.Helper()
+	root, err := execGit(dir, "rev-list", "--max-parents=0", "refs/ledger/"+slug)
+	if err != nil || root == "" {
+		t.Fatalf("root commit of %s: %v", slug, err)
+	}
+	m, err := execGit(dir, "show", root+":meta.json")
+	if err != nil || m == "" {
+		t.Fatalf("meta.json of %s: %v", slug, err)
+	}
+	return m
+}
+
+// TestImportAddsReleaseRule: a ledger with events and no blocked-by is
+// exported, then imported onto a new slug with the add flags. Counts match,
+// the source meta is untouched, and on the copy ready holds the dependent of
+// a closed, unmerged blocker until merged is added. A second --release on an
+// export that already has a rule is refused.
+func TestImportAddsReleaseRule(t *testing.T) {
+	dir := initRepo(t)
+	if _, se, code := run(t, dir, "create", "old", "--scope", "s",
+		"--field", "status=open,in-progress,closed,human", "--terminal", "status=closed,human",
+		"--multi-field", "labels", "--guard", "status"); code != 0 {
+		t.Fatal(se)
+	}
+	so, se, code := run(t, dir, "set", "blk", "status=open", "--expect", "none", "-m", "blocker", "--ledger", "old", "--as", "a")
+	if code != 0 {
+		t.Fatal(se)
+	}
+	openID := mustJSON(t, so)["id"].(string)
+	for _, args := range [][]string{
+		{"set", "blk", "status=closed", "--expect", openID, "-m", "done", "--evidence", "commit:abc"},
+		{"set", "dep", "status=open", "--expect", "none", "-m", "dependent"},
+	} {
+		if _, se, code := run(t, dir, append(args, "--ledger", "old", "--as", "a")...); code != 0 {
+			t.Fatalf("%v: %s", args, se)
+		}
+	}
+	srcMetaBefore := ledgerMeta(t, dir, "old")
+
+	f := filepath.Join(t.TempDir(), "old.jsonl")
+	so, se, code = run(t, dir, "export", "old", "--to", f)
+	if code != 0 {
+		t.Fatal(se)
+	}
+	exported := mustJSON(t, so)["exported"]
+
+	// Adding a rule without blocked-by declared must be refused.
+	if _, se, code := run(t, dir, "import", f, "--slug", "bad", "--release", "status=closed"); code != 4 || !strings.Contains(se, "blocked-by") {
+		t.Fatalf("rule without blocked-by must be refused: %d %s", code, se)
+	}
+	// Re-declaring a field the export already has must be refused.
+	if _, se, code := run(t, dir, "import", f, "--slug", "bad2", "--multi-field", "labels"); code != 4 || !strings.Contains(se, "already declares") {
+		t.Fatalf("duplicate multi-field must be refused: %d %s", code, se)
+	}
+	if _, se, code := run(t, dir, "import", f, "--slug", "bad3", "--guard", "status"); code != 4 || !strings.Contains(se, "already guards") {
+		t.Fatalf("duplicate guard must be refused: %d %s", code, se)
+	}
+
+	so, se, code = run(t, dir, "import", f, "--slug", "new",
+		"--multi-field", "blocked-by", "--guard", "blocked-by",
+		"--release", "status=closed", "--release", "labels=merged")
+	if code != 0 {
+		t.Fatal(se)
+	}
+	if imported := mustJSON(t, so)["imported"]; imported != exported {
+		t.Fatalf("imported %v != exported %v", imported, exported)
+	}
+	if after := ledgerMeta(t, dir, "old"); after != srcMetaBefore {
+		t.Fatalf("source meta must be unchanged:\nbefore %s\nafter  %s", srcMetaBefore, after)
+	}
+
+	if m := ledgerMeta(t, dir, "new"); !strings.Contains(m, `"release"`) || !strings.Contains(m, "blocked-by") || strings.Contains(srcMetaBefore, "blocked-by") {
+		t.Fatalf("new meta must carry blocked-by and the rule, source must not: %s", m)
+	}
+
+	readyKeys := func() (ready, blocked []string) {
+		so, se, code := run(t, dir, "ready", "--ledger", "new")
+		if code != 0 {
+			t.Fatalf("ready: %s", se)
+		}
+		doc := mustJSON(t, so)
+		for _, e := range doc["ready"].([]any) {
+			ready = append(ready, e.(map[string]any)["key"].(string))
+		}
+		for _, e := range doc["blocked"].([]any) {
+			blocked = append(blocked, e.(map[string]any)["key"].(string))
+		}
+		return
+	}
+	for _, args := range [][]string{
+		{"set", "dep", "blocked-by=blk"},
+	} {
+		if _, se, code := run(t, dir, append(args, "--ledger", "new", "--expect", "none", "--as", "a")...); code != 0 {
+			t.Fatalf("%v: %s", args, se)
+		}
+	}
+	ready, blocked := readyKeys()
+	if strings.Join(ready, ",") != "" || strings.Join(blocked, ",") != "dep" {
+		t.Fatalf("closed, unmerged blocker must hold dep: ready %v blocked %v", ready, blocked)
+	}
+	if _, se, code := run(t, dir, "set", "blk", "labels=merged", "--ledger", "new", "--as", "a"); code != 0 {
+		t.Fatal(se)
+	}
+	ready, blocked = readyKeys()
+	if strings.Join(ready, ",") != "dep" || len(blocked) != 0 {
+		t.Fatalf("merged must release dep: ready %v blocked %v", ready, blocked)
+	}
+
+	// A second --release on an export that already has a rule is refused.
+	f2 := filepath.Join(t.TempDir(), "new.jsonl")
+	if _, se, code := run(t, dir, "export", "new", "--to", f2); code != 0 {
+		t.Fatal(se)
+	}
+	if _, se, code := run(t, dir, "import", f2, "--slug", "again", "--release", "status=human"); code != 4 || !strings.Contains(se, "already declares a release rule") {
+		t.Fatalf("second --release must be refused: %d %s", code, se)
+	}
+	// Importing it with no add flags keeps the rule.
+	if _, se, code := run(t, dir, "import", f2, "--slug", "kept"); code != 0 {
+		t.Fatal(se)
+	}
+	if m := ledgerMeta(t, dir, "kept"); !strings.Contains(m, "merged") {
+		t.Fatalf("plain import must keep the rule: %s", m)
+	}
+}

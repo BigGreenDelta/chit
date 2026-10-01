@@ -17,12 +17,12 @@ func init() { register(newCreateCmd) }
 
 func newCreateCmd(c *Ctx) *cobra.Command {
 	var scope, owner, supersedes, asFlag, mFlag, staleAfter string
-	var fields, reqEv, multiFields, terminal, guard []string
+	var fields, reqEv, multiFields, terminal, guard, release []string
 	cmd := &cobra.Command{Use: "create <slug>", Short: "start a new ledger with declared fields",
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			return runCreate(c, args[0], scope, owner, supersedes, asFlag, mFlag, staleAfter,
-				fields, reqEv, multiFields, terminal, guard)
+				fields, reqEv, multiFields, terminal, guard, release)
 		}}
 	cmd.Flags().StringVar(&scope, "scope", "", "what this ledger tracks")
 	cmd.MarkFlagRequired("scope")
@@ -31,6 +31,7 @@ func newCreateCmd(c *Ctx) *cobra.Command {
 	cmd.Flags().StringArrayVar(&multiFields, "multi-field", nil, "NAME: a multi-valued, vocab-free field; repeatable")
 	cmd.Flags().StringArrayVar(&terminal, "terminal", nil, "FIELD=V1,V2: values that end a key's participation as a blocker; repeatable")
 	cmd.Flags().StringArrayVar(&guard, "guard", nil, "FIELD: this field takes conditional writes only; repeatable")
+	cmd.Flags().StringArrayVar(&release, "release", nil, "status=V1,V2 and/or labels=L1,L2: a blocked-by edge releases only when the blocker meets both; repeatable (undeclared = any terminal status releases)")
 	cmd.Flags().StringVar(&staleAfter, "stale-after", "", "staleness horizon (Go duration, e.g. 2h); undeclared = never stale")
 	cmd.Flags().StringVar(&owner, "owner", "", "recorded owner (not enforced in v1)")
 	cmd.Flags().StringVar(&supersedes, "supersedes", "", "predecessor slug to close and link")
@@ -40,7 +41,7 @@ func newCreateCmd(c *Ctx) *cobra.Command {
 }
 
 func runCreate(c *Ctx, slug, scope, owner, supersedes, asFlag, mFlag, staleAfter string,
-	fieldSpecs, reqSpecs, multiFields, terminalSpecs, guard []string) error {
+	fieldSpecs, reqSpecs, multiFields, terminalSpecs, guard, releaseSpecs []string) error {
 	if !model.ValidSlug(slug) {
 		return out.Errf("bad_slug", "slugs are lowercase-kebab: [a-z0-9][a-z0-9-]*, max 64 chars", 4,
 			"'%s' is not a valid slug", slug)
@@ -78,20 +79,23 @@ func runCreate(c *Ctx, slug, scope, owner, supersedes, asFlag, mFlag, staleAfter
 		f, vals, _ := strings.Cut(spec, "=")
 		terminal[f] = strings.Split(vals, ",")
 	}
+	rule, err := model.ParseReleaseSpecs(releaseSpecs)
+	if err != nil {
+		return out.Errf("bad_value", "e.g. --release status=closed --release labels=merged", 4, "%s", err)
+	}
 	author := model.ResolveAuthor(asFlag)
 	ev := model.NewEvent("create", author, c.Store.Repo)
 	ev.Text = mFlag
 	base, _, _ := c.Store.Repo.Git("", "rev-parse", "--short", "HEAD")
 	meta := model.Meta{Slug: slug, Scope: scope, Created: ev.TS, CreatedBy: author,
 		Owner: owner, Supersedes: supersedes, Base: base, Fields: fields, RequireEvidence: require,
-		FieldOrder: fieldOrder, MultiFields: multiFields, Terminal: terminal, Guard: guard, StaleAfter: staleAfter}
+		FieldOrder: fieldOrder, MultiFields: multiFields, Terminal: terminal, Guard: guard, StaleAfter: staleAfter, Release: rule}
 	if declErr := model.ValidateDeclarations(meta); declErr != nil {
 		return out.Errf(declErr.Ident, declErr.Hint, 4, "%s", declErr.Msg)
 	}
 	mb, _ := json.MarshalIndent(meta, "", " ")
 
 	var id string
-	var err error
 	if supersedes == "" {
 		id, err = c.Store.Append(slug, ev, map[string]string{"meta.json": string(mb)}, store.ExpectAbsent)
 		if err != nil {
