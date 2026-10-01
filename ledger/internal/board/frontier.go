@@ -566,7 +566,7 @@ func (b *Board) detectCycles(names []string) []AttentionEntry {
 			return
 		}
 		k := b.Keys[name]
-		if k == nil || k.Status == nil || b.IsTerminal(k.Status.Value) {
+		if k == nil || k.Status == nil || b.Releases(k) {
 			return
 		}
 		onPath[name] = true
@@ -669,7 +669,7 @@ func (b *Board) youngerEdge(a, c string) bool {
 func (b *Board) allEdgesTerminal(k *Key) bool {
 	for _, name := range k.BlockedBy() {
 		blocker, exists := b.Keys[name]
-		if !exists || blocker.Status == nil || !b.IsTerminal(blocker.Status.Value) {
+		if !exists || !b.Releases(blocker) {
 			return false
 		}
 	}
@@ -687,7 +687,7 @@ func (b *Board) allEdgesTerminal(k *Key) bool {
 func (b *Board) allEdgesTerminalUnevidenced(k *Key) (terminal bool, unevidenced []string) {
 	for _, name := range k.BlockedBy() {
 		blocker, exists := b.Keys[name]
-		if !exists || blocker.Status == nil || !b.IsTerminal(blocker.Status.Value) {
+		if !exists || !b.Releases(blocker) {
 			return false, nil
 		}
 		if len(blocker.Status.Evidence) == 0 {
@@ -698,9 +698,11 @@ func (b *Board) allEdgesTerminalUnevidenced(k *Key) (terminal bool, unevidenced 
 }
 
 // blockerState classifies one blocker by name for a waiting_on entry (spec
-// "blocked": state ∈ terminal | open | in-progress | in-progress-stale |
-// human | statusless). Terminal wins whenever the blocker's status is
-// terminal, labeled or not; human names only a non-terminal human-owned
+// "blocked": state ∈ terminal | unreleased | open | in-progress |
+// in-progress-stale | human | statusless). Terminal wins whenever the
+// blocker releases the edge (any terminal status, labeled or not, unless
+// the ledger declares a release rule); unreleased names a terminal blocker
+// the declared rule still holds (e.g. closed without the required label); human names only a non-terminal human-owned
 // blocker (a human+claimed blocker still renders "human" — the accepted
 // flattening); a missing key or a present key with no status write alike
 // report statusless.
@@ -709,8 +711,11 @@ func (b *Board) blockerState(name string, now time.Time) string {
 	if !exists || blocker.Status == nil {
 		return "statusless"
 	}
-	if b.IsTerminal(blocker.Status.Value) {
+	if b.Releases(blocker) {
 		return "terminal"
+	}
+	if b.IsTerminal(blocker.Status.Value) {
+		return "unreleased" // terminal but the declared release rule is not met
 	}
 	if blocker.HasHuman() {
 		return "human"

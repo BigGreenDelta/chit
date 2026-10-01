@@ -107,3 +107,48 @@ func TestCreateDeclarationRejections(t *testing.T) {
 		}
 	}
 }
+
+// TestCreateReleaseRule: dgd's shape is accepted and persisted; a rule on a
+// board that is not ready-capable, a status outside the terminal set, labels
+// without the labels multi-field, and a malformed spec are all refused.
+func TestCreateReleaseRule(t *testing.T) {
+	dir := initRepo(t)
+	base := []string{"--scope", "s", "--field", "status=open,in-progress,closed,human",
+		"--terminal", "status=closed,human", "--guard", "status", "--guard", "blocked-by"}
+	create := func(slug string, extra ...string) (string, int) {
+		_, se, code := run(t, dir, append(append([]string{"create", slug}, base...), extra...)...)
+		return se, code
+	}
+	if se, code := create("dgd", "--multi-field", "labels", "--multi-field", "blocked-by",
+		"--release", "status=closed", "--release", "labels=merged"); code != 0 {
+		t.Fatalf("dgd's shape must be accepted: %s", se)
+	}
+	meta, err := execGit(dir, "show", "refs/ledger/dgd:meta.json")
+	if err != nil || !strings.Contains(meta, `"release"`) || !strings.Contains(meta, "merged") {
+		t.Fatalf("rule must persist in meta.json (err %v): %s", err, meta)
+	}
+	cases := []struct {
+		name  string
+		extra []string
+		want  string
+	}{
+		{"status-outside-terminal", []string{"--multi-field", "labels", "--multi-field", "blocked-by", "--release", "status=open"}, "terminal"},
+		{"labels-without-multifield", []string{"--multi-field", "blocked-by", "--release", "status=closed", "--release", "labels=merged"}, "labels"},
+		{"no-blocked-by", []string{"--multi-field", "labels", "--release", "status=closed"}, "blocked-by"},
+		{"labels-only", []string{"--multi-field", "labels", "--multi-field", "blocked-by", "--release", "labels=merged"}, "at least one status"},
+		{"bad-key", []string{"--multi-field", "labels", "--multi-field", "blocked-by", "--release", "owner=x"}, "only status and labels"},
+		{"bad-spec", []string{"--multi-field", "labels", "--multi-field", "blocked-by", "--release", "closed"}, "must look like"},
+	}
+	for _, tc := range cases {
+		se, code := create("bad-"+tc.name, tc.extra...)
+		if code != 4 || !strings.Contains(se, "bad_value") || !strings.Contains(se, tc.want) {
+			t.Errorf("%s: want exit 4 bad_value mentioning %q, got %d: %s", tc.name, tc.want, code, se)
+		}
+	}
+	// Not ready-capable: a plain board.
+	_, se, code := run(t, dir, "create", "plain", "--scope", "s", "--field", "status=open,done",
+		"--multi-field", "blocked-by", "--release", "status=done")
+	if code != 4 || !strings.Contains(se, "ready-capable") {
+		t.Errorf("a rule on a non-ready-capable board must be refused: %d %s", code, se)
+	}
+}

@@ -2,6 +2,7 @@
 package model
 
 import (
+	"fmt"
 	"os"
 	"regexp"
 	"strings"
@@ -93,6 +94,47 @@ type Meta struct {
 	Terminal        map[string][]string `json:"terminal,omitempty"`
 	Guard           []string            `json:"guard,omitempty"`
 	StaleAfter      string              `json:"stale_after,omitempty"` // Go time.ParseDuration input, verbatim
+	Release         *ReleaseRule        `json:"release,omitempty"`     // blocked-by release rule; nil = any terminal status releases
+}
+
+// ReleaseRule is a ledger's declared blocked-by release rule. A blocker
+// releases an edge only when its status is in Status AND its labels contain
+// every entry of Labels (Labels may be empty: status alone decides).
+type ReleaseRule struct {
+	Status []string `json:"status"`
+	Labels []string `json:"labels,omitempty"`
+}
+
+// ParseReleaseSpecs builds a rule from repeatable --release SPEC values,
+// each "status=V1,V2" or "labels=L1,L2". Repeats of one key accumulate.
+// No specs yields a nil rule. Whether the rule fits the board is
+// ValidateDeclarations' question, not this parser's.
+func ParseReleaseSpecs(specs []string) (*ReleaseRule, error) {
+	if len(specs) == 0 {
+		return nil, nil
+	}
+	r := &ReleaseRule{}
+	for _, spec := range specs {
+		key, vals, ok := strings.Cut(spec, "=")
+		if !ok || vals == "" {
+			return nil, fmt.Errorf("--release '%s' must look like status=V1,V2 or labels=L1,L2", spec)
+		}
+		toks := strings.Split(vals, ",")
+		for _, t := range toks {
+			if t == "" {
+				return nil, fmt.Errorf("--release '%s' has an empty value", spec)
+			}
+		}
+		switch key {
+		case "status":
+			r.Status = append(r.Status, toks...)
+		case "labels":
+			r.Labels = append(r.Labels, toks...)
+		default:
+			return nil, fmt.Errorf("--release names '%s'; only status and labels are supported", key)
+		}
+	}
+	return r, nil
 }
 
 func HarnessMarker() string {

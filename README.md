@@ -120,6 +120,56 @@ with author and provenance, a bad one is fixed by rolling *it* up under a
 corrected line, and nothing is ever rewritten. `chit rollup` (bare)
 shows what's unrolled and how to submit.
 
+## Blocked-by release rule
+
+On a ready-capable board that declares `blocked-by`, a `blocked-by` edge
+releases by default when its blocker reaches any terminal status, labels
+ignored. A ledger can declare a stricter rule at `create`:
+
+```
+chit create issues --scope "..." \
+  --field status=open,in-progress,closed,human --terminal status=closed,human \
+  --multi-field labels --multi-field blocked-by --guard status --guard blocked-by \
+  --release status=closed --release labels=merged
+```
+
+An edge is then released only when the blocker's latest status is in the
+`status=` set (a non-empty subset of the terminal set) AND its labels contain
+every `labels=` entry. The rule needs `blocked-by` declared, and `labels=`
+needs the `labels` multi-field. With no `--release`, nothing changes. The
+rule is not sticky: removing `merged` later blocks the dependents again,
+the way reopening a blocker does. `chit ready`, its cycle detection and its
+`unblocked_without_evidence` report all follow the rule; the evidence check
+still reads the blocker's terminal status event.
+
+`waiting_on` state, per blocker in the blocked and held lists: `terminal`
+(releases the edge), `unreleased` (terminal, but the declared rule is not
+met, e.g. closed without `merged`), `open`, `in-progress`,
+`in-progress-stale`, `human`, `statusless`.
+
+### One way to add the rule to an existing ledger
+
+A live ledger's declarations are immutable, and `chit vocab add` refuses a
+ready-capable board's status vocab. This is not a migration plan for any
+particular ledger. It is one tool: rebuild the ledger onto a new slug with
+`chit export` and `chit import`, whose add flags only ever add to the
+exported declaration:
+
+```
+chit export old --to old.jsonl                  # prints "exported": N
+chit import old.jsonl --slug old-2 \
+  --multi-field blocked-by --guard blocked-by \
+  --release status=closed --release labels=merged   # prints "imported": N
+```
+
+Compare the `exported` and `imported` counts. Import refuses a
+`--multi-field` or `--guard` the export already declares, and refuses
+`--release` when the export already has a rule. It cannot change the status
+vocab, the terminal set or an existing rule. The source ledger is not
+touched. Event ids and the slug do not survive the rebuild (ids are minted
+at commit time, slugs are never reused), so anything holding old cursors or
+event ids, or the old slug, must move to the new ones.
+
 ## Coordination
 
 Write ids double as cursors. `chit since <cursor>` reads exactly-once;

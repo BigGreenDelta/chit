@@ -40,7 +40,43 @@ func ValidateDeclarations(m Meta) *DeclErr {
 	if e := validateMultiFieldNames(m); e != nil {
 		return e
 	}
-	return validateReadyCapableShape(m)
+	if e := validateReadyCapableShape(m); e != nil {
+		return e
+	}
+	return validateRelease(m)
+}
+
+// validateRelease checks a declared blocked-by release rule: it needs a
+// ready-capable board that declares blocked-by, its statuses must be a
+// non-empty subset of the terminal status set, and its labels need the
+// labels multi-field.
+func validateRelease(m Meta) *DeclErr {
+	r := m.Release
+	if r == nil {
+		return nil
+	}
+	bad := func(hint, msg string, a ...any) *DeclErr {
+		return &DeclErr{Ident: "bad_value", Hint: hint, Msg: fmt.Sprintf(msg, a...)}
+	}
+	if !ReadyCapable(m) {
+		return bad("add --terminal status=... (and its other ready-capable declarations)",
+			"--release needs a ready-capable board (--terminal on status)")
+	}
+	if !Contains(m.MultiFields, "blocked-by") {
+		return bad("add --multi-field blocked-by --guard blocked-by",
+			"--release needs a declared 'blocked-by' multi-field: the rule decides when its edges release")
+	}
+	if len(r.Status) == 0 {
+		return bad("add --release status=V1,V2", "--release needs at least one status")
+	}
+	if !subsetOf(r.Status, m.Terminal["status"]) {
+		return bad("--release status values must be a subset of the terminal set: "+strings.Join(m.Terminal["status"], ", "),
+			"--release status=%s is not a subset of the terminal status set", strings.Join(r.Status, ","))
+	}
+	if len(r.Labels) > 0 && !Contains(m.MultiFields, "labels") {
+		return bad("add --multi-field labels", "--release labels=... needs a 'labels' multi-field declared")
+	}
+	return nil
 }
 
 // TitleFieldName is the one reserved field name: a key's title is not a
