@@ -45,6 +45,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unsafe"
 
 	"ledger/internal/board"
 	"ledger/internal/dag"
@@ -290,7 +291,12 @@ func loadRawBlob(g Git, ref string) ([]byte, string, error) {
 		return nil, sha, &UnreadableCacheError{Sha: sha,
 			Reason: fmt.Sprintf("%s is a %s, not a blob", sha, objs[0].Type)}
 	}
-	return []byte(objs[0].Content), sha, nil
+	// dgd-431: view the batch's string as bytes instead of copying it, which
+	// was a second full pass over a 6-7 MB index blob on every read. Content
+	// is never written after Batch returns it, and every LoadRaw caller only
+	// reads the bytes (decode, byte-compare), so the view is safe.
+	content := objs[0].Content
+	return unsafe.Slice(unsafe.StringData(content), len(content)), sha, nil
 }
 
 // Read is the three-branch read path.

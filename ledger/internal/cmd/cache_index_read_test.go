@@ -41,6 +41,16 @@ func enrichFixture(t *testing.T, f cacheFixture) {
 		"--ledger", f.slug, "-m", "a ledger-wide gotcha", "--as", "bob")
 }
 
+// appendKeyTail adds tail events on the one key the per-key reads name (a
+// set and a note), so status <key> and notes --key merge tail records into
+// a section the blob already holds, not only into keys the tail introduces.
+func appendKeyTail(t *testing.T, f cacheFixture) {
+	t.Helper()
+	mustRun(t, f.dir, "set", "cache-test-key", "labels=tail", "--ledger", f.slug, "-m", "tail set", "--as", "alice")
+	mustRun(t, f.dir, "note", "--kind", "handoff", "--key", "cache-test-key",
+		"--ledger", f.slug, "-m", "a tail note", "--as", "alice")
+}
+
 func deleteBothRefs(t *testing.T, f cacheFixture) {
 	t.Helper()
 	deleteCacheRef(t, f)
@@ -134,6 +144,7 @@ func TestStatusOffCacheIsByteIdenticalToFoldFromRoot(t *testing.T) {
 			}
 
 			appendTail(t, f, 5)
+			appendKeyTail(t, f)
 			mustOrigin(t, f, cache.OriginTail)
 			mustIndexOrigin(t, f, cache.OriginTail)
 			for _, args := range cases {
@@ -145,6 +156,7 @@ func TestStatusOffCacheIsByteIdenticalToFoldFromRoot(t *testing.T) {
 				}
 				resetBothRefs(t, f)
 				appendTail(t, f, 5)
+				appendKeyTail(t, f)
 			}
 		})
 	}
@@ -261,6 +273,7 @@ func TestNotesOffCacheIsByteIdenticalToFoldFromRoot(t *testing.T) {
 			}
 
 			appendTail(t, f, 5)
+			appendKeyTail(t, f)
 			mustOrigin(t, f, cache.OriginTail)
 			mustIndexOrigin(t, f, cache.OriginTail)
 			for _, args := range cases {
@@ -272,6 +285,7 @@ func TestNotesOffCacheIsByteIdenticalToFoldFromRoot(t *testing.T) {
 				}
 				resetBothRefs(t, f)
 				appendTail(t, f, 5)
+				appendKeyTail(t, f)
 			}
 		})
 	}
