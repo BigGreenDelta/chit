@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -197,8 +198,8 @@ func requireEvidenceOf(meta model.Meta) map[string][]string {
 // findByID's full scan" the spec calls out: a prefix match against the
 // index's lightweight event records costs nothing per event beyond a
 // string comparison, with no body ever read for events that don't match.
-func findByIDInIndex(idx cache.Index, id string) (rec cache.EventRec, matches int) {
-	for _, er := range idx.Events {
+func findByIDInIndex(all []cache.EventRec, id string) (rec cache.EventRec, matches int) {
+	for _, er := range all {
 		if strings.HasPrefix(er.ID, id) {
 			rec = er
 			matches++
@@ -232,12 +233,15 @@ func unionRecs(sets ...[]cache.EventRec) []cache.EventRec {
 // (dgd-272) instead of a per-call `git log` on the store. The name rides in
 // the blob already - idx.Events[i].CI is that event's slot in
 // idx.Committers - so this is a pure in-memory pass over data already read.
+// recs is the records the caller already holds, which are the only events
+// whose committers the render can ask for (dgd-431: no section is decoded
+// just to build this map).
 // The *Folded twins (and cmd/render.go) still read committer names the old
 // way, off the store directly; only the index-backed paths have a
 // Committers table to build this off of.
-func committersFromIndex(idx cache.Index) map[string]string {
-	m := make(map[string]string, len(idx.Events))
-	for _, er := range idx.Events {
+func committersFromIndex(idx cache.Index, recs []cache.EventRec) map[string]string {
+	m := make(map[string]string, len(recs))
+	for _, er := range recs {
 		if er.CI >= 0 && er.CI < len(idx.Committers) {
 			m[er.ID] = idx.Committers[er.CI]
 		}
@@ -537,7 +541,9 @@ func runStatus(c *Ctx, key, field string, byBranch bool, ledgerFlag string) erro
 		if key == "" {
 			return runStatusAllCached(c, p, idx, field)
 		}
-		return runStatusKeyCached(c, p, idx, key, field)
+		if err := runStatusKeyCached(c, p, idx, key, field); !errors.Is(err, cache.ErrIndexSection) {
+			return err
+		}
 	}
 	led, err := c.Load(p.Slug)
 	if err != nil {
@@ -668,11 +674,9 @@ func runStatusKeyCached(c *Ctx, p cache.Projection, idx cache.Index, key, field 
 	}
 	sort.Strings(fieldNames)
 
-	var forKey []cache.EventRec
-	for _, er := range idx.Events {
-		if er.Key == key {
-			forKey = append(forKey, er)
-		}
+	forKey, err := idx.EventsForKey(key)
+	if err != nil {
+		return err
 	}
 	var noteRecs []cache.EventRec
 	for _, er := range forKey {
@@ -689,7 +693,7 @@ func runStatusKeyCached(c *Ctx, p cache.Projection, idx cache.Index, key, field 
 		return out.Errf("git_failed", "", 1, "%s", err)
 	}
 
-	committers := committersFromIndex(idx)
+	committers := committersFromIndex(idx, forKey)
 	notes := []noteDoc{}
 	var noteEvs []model.Event
 	for _, er := range noteRecs {
@@ -760,7 +764,9 @@ func runShow(c *Ctx, ledgerFlag string, whereRaw []string, idFlag string) error 
 		return err
 	}
 	if ok {
-		return runShowCached(c, p, idx, whereRaw)
+		if err := runShowCached(c, p, idx, whereRaw); !errors.Is(err, cache.ErrIndexSection) {
+			return err
+		}
 	}
 	led, err := c.Load(p.Slug)
 	if err != nil {
@@ -873,10 +879,14 @@ func runShowCached(c *Ctx, p cache.Projection, idx cache.Index, whereRaw []strin
 		}
 		rows = kept
 	}
-	committers := committersFromIndex(idx)
+	all, err := idx.AllEvents()
+	if err != nil {
+		return err
+	}
+	committers := committersFromIndex(idx, all)
 
 	var noteRecs []cache.EventRec
-	for _, er := range idx.Events {
+	for _, er := range all {
 		if er.Type == "note" {
 			noteRecs = append(noteRecs, er)
 		}
@@ -902,10 +912,10 @@ func runShowCached(c *Ctx, p cache.Projection, idx cache.Index, whereRaw []strin
 		})
 	}
 
-	eventCount := len(idx.Events)
+	eventCount := len(all)
 	head := ""
 	if eventCount > 0 {
-		head = idx.Events[eventCount-1].ID
+		head = all[eventCount-1].ID
 	}
 	payload := map[string]any{
 		"ledger": p.Slug, "scope": p.Meta.Scope, "state": p.State, "rows": rows,
@@ -1044,7 +1054,9 @@ func runShowID(c *Ctx, ledgerFlag, id string) error {
 		return err
 	}
 	if ok {
-		return runShowIDCached(c, p, idx, id)
+		if err := runShowIDCached(c, p, idx, id); !errors.Is(err, cache.ErrIndexSection) {
+			return err
+		}
 	}
 	led, err := c.Load(p.Slug)
 	if err != nil {
@@ -1078,7 +1090,11 @@ func runShowIDFolded(c *Ctx, led *fold.Ledger, id string) error {
 // only the index's lightweight event records (findByIDInIndex), and the
 // matched event's body is the only one ever fetched.
 func runShowIDCached(c *Ctx, p cache.Projection, idx cache.Index, id string) error {
-	rec, matches := findByIDInIndex(idx, id)
+	all, err := idx.AllEvents()
+	if err != nil {
+		return err
+	}
+	rec, matches := findByIDInIndex(all, id)
 	if matches != 1 {
 		return idReadErr(p.Slug, id, matches)
 	}
@@ -1090,7 +1106,7 @@ func runShowIDCached(c *Ctx, p cache.Projection, idx cache.Index, id string) err
 	if !ok {
 		return out.Errf("git_failed", "", 1, "event %s: body not found", rec.ID)
 	}
-	committers := committersFromIndex(idx)
+	committers := committersFromIndex(idx, []cache.EventRec{rec})
 	payload := eventJSON(ev)
 	payload["ledger"] = p.Slug
 	payload["via"] = committers[ev.ID]
@@ -1215,7 +1231,9 @@ func runNotes(c *Ctx, kind, key, id string, latest bool, limit int, ledgerFlag, 
 		return err
 	}
 	if ok {
-		return runNotesCached(c, p, idx, kind, key, id, latest, limit, now)
+		if err := runNotesCached(c, p, idx, kind, key, id, latest, limit, now); !errors.Is(err, cache.ErrIndexSection) {
+			return err
+		}
 	}
 	led, err := c.Load(p.Slug)
 	if err != nil {
@@ -1276,8 +1294,19 @@ func runNotesFolded(c *Ctx, led *fold.Ledger, kind, key, id string, latest bool,
 // per-render notes calls, ten of which sweep by kind across the whole
 // ledger with no --key, are exactly this shape.
 func runNotesCached(c *Ctx, p cache.Projection, idx cache.Index, kind, key, id string, latest bool, limit int, now time.Time) error {
+	// --key reads one section; every other selection needs the whole chain.
+	var scan []cache.EventRec
+	var err error
+	if key != "" {
+		scan, err = idx.EventsForKey(key)
+	} else {
+		scan, err = idx.AllEvents()
+	}
+	if err != nil {
+		return err
+	}
 	var matchedRecs []cache.EventRec
-	for _, er := range idx.Events {
+	for _, er := range scan {
 		if er.Type != "note" {
 			continue
 		}
@@ -1293,7 +1322,11 @@ func runNotesCached(c *Ctx, p cache.Projection, idx cache.Index, kind, key, id s
 		matchedRecs = append(matchedRecs, er)
 	}
 	if id != "" && len(matchedRecs) == 0 {
-		rec, m := findByIDInIndex(idx, id)
+		all, err := idx.AllEvents()
+		if err != nil {
+			return err
+		}
+		rec, m := findByIDInIndex(all, id)
 		if m != 1 || rec.Type != "note" {
 			return notesIDErr(p.Slug, id, model.Event{Type: rec.Type}, m)
 		}
@@ -1316,7 +1349,7 @@ func runNotesCached(c *Ctx, p cache.Projection, idx cache.Index, kind, key, id s
 		}
 	}
 
-	committers := committersFromIndex(idx)
+	committers := committersFromIndex(idx, matchedRecs)
 	docs := make([]noteDoc, 0, len(matched))
 	for _, note := range matched {
 		docs = append(docs, noteDocOf(note, committers))

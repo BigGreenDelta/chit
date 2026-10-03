@@ -70,9 +70,9 @@ func runCacheReset(c *Ctx, slug string) error {
 	indexSha, _ := c.Store.RevParse(store.CacheIndexRef(slug))
 	payload := map[string]any{"ledger": slug, "ref": store.CacheRef(slug), "blob": sha,
 		"base": p.Base, "events": p.Count, "keys": len(p.Board.Keys),
-		"index_ref": store.CacheIndexRef(slug), "index_blob": indexSha, "index_events": len(ix.Events)}
+		"index_ref": store.CacheIndexRef(slug), "index_blob": indexSha, "index_events": ix.Count}
 	outEmit(c, payload, []string{fmt.Sprintf("%s  cache rebuilt from root: %d events, %d keys, base %s (index: %d event records)",
-		slug, p.Count, len(p.Board.Keys), short(p.Base), len(ix.Events))})
+		slug, p.Count, len(p.Board.Keys), short(p.Base), ix.Count)})
 	return nil
 }
 
